@@ -349,6 +349,8 @@ func (p *Parser) parseContentBlock(blockData any) (shared.ContentBlock, error) {
 		return p.parseToolUseBlock(data)
 	case shared.ContentBlockTypeToolResult:
 		return p.parseToolResultBlock(data)
+	case shared.ContentBlockTypeImage:
+		return p.parseImageBlock(data)
 	default:
 		return nil, shared.NewMessageParseError(
 			fmt.Sprintf("unknown content block type: %s", blockType),
@@ -362,7 +364,7 @@ func (p *Parser) parseTextBlock(data map[string]any) (shared.ContentBlock, error
 	if !ok {
 		return nil, shared.NewMessageParseError("text block missing text field", data)
 	}
-	return &shared.TextBlock{Text: text}, nil
+	return &shared.TextBlock{MessageType: shared.ContentBlockTypeText, Text: text}, nil
 }
 
 func (p *Parser) parseThinkingBlock(data map[string]any) (shared.ContentBlock, error) {
@@ -372,8 +374,9 @@ func (p *Parser) parseThinkingBlock(data map[string]any) (shared.ContentBlock, e
 	}
 	signature, _ := data["signature"].(string) // Optional field
 	return &shared.ThinkingBlock{
-		Thinking:  thinking,
-		Signature: signature,
+		MessageType: shared.ContentBlockTypeThinking,
+		Thinking:    thinking,
+		Signature:   signature,
 	}, nil
 }
 
@@ -391,9 +394,10 @@ func (p *Parser) parseToolUseBlock(data map[string]any) (shared.ContentBlock, er
 		input = make(map[string]any)
 	}
 	return &shared.ToolUseBlock{
-		ToolUseID: id,
-		Name:      name,
-		Input:     input,
+		MessageType: shared.ContentBlockTypeToolUse,
+		ToolUseID:   id,
+		Name:        name,
+		Input:       input,
 	}, nil
 }
 
@@ -411,9 +415,30 @@ func (p *Parser) parseToolResultBlock(data map[string]any) (shared.ContentBlock,
 	}
 
 	return &shared.ToolResultBlock{
-		ToolUseID: toolUseID,
-		Content:   data["content"],
-		IsError:   isError,
+		MessageType: shared.ContentBlockTypeToolResult,
+		ToolUseID:   toolUseID,
+		Content:     data["content"],
+		IsError:     isError,
+	}, nil
+}
+
+func (p *Parser) parseImageBlock(data map[string]any) (shared.ContentBlock, error) {
+	sourceData, ok := data["source"].(map[string]any)
+	if !ok {
+		return nil, shared.NewMessageParseError("image block missing source field", data)
+	}
+	sourceType, _ := sourceData["type"].(string)
+	mediaType, _ := sourceData["media_type"].(string)
+	base64Data, _ := sourceData["data"].(string)
+	url, _ := sourceData["url"].(string)
+	return &shared.ImageBlock{
+		MessageType: "image",
+		Source: shared.ImageSource{
+			Type:      sourceType,
+			MediaType: mediaType,
+			Data:      base64Data,
+			URL:       url,
+		},
 	}, nil
 }
 

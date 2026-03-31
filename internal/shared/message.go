@@ -25,6 +25,7 @@ const (
 	ContentBlockTypeThinking   = "thinking"
 	ContentBlockTypeToolUse    = "tool_use"
 	ContentBlockTypeToolResult = "tool_result"
+	ContentBlockTypeImage      = "image"
 )
 
 // AssistantMessageError represents error types in assistant messages.
@@ -250,6 +251,25 @@ type ToolResultBlock struct {
 // BlockType returns the content block type for ToolResultBlock.
 func (b *ToolResultBlock) BlockType() string {
 	return ContentBlockTypeToolResult
+}
+
+// ImageSource describes the source data for an image content block.
+type ImageSource struct {
+	Type      string `json:"type"`           // "base64" or "url"
+	MediaType string `json:"media_type"`     // "image/png", "image/jpeg", "image/gif", "image/webp"
+	Data      string `json:"data,omitempty"` // base64-encoded data (for type "base64")
+	URL       string `json:"url,omitempty"`  // URL (for type "url")
+}
+
+// ImageBlock represents an image content block.
+type ImageBlock struct {
+	MessageType string      `json:"type"` // always "image"
+	Source      ImageSource `json:"source"`
+}
+
+// BlockType returns the content block type for ImageBlock.
+func (b *ImageBlock) BlockType() string {
+	return ContentBlockTypeImage
 }
 
 // RawControlMessage wraps raw control protocol messages for passthrough to the control handler.
