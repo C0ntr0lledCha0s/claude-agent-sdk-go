@@ -23,6 +23,7 @@ type Client interface {
 	Disconnect() error
 	Query(ctx context.Context, prompt string) error
 	QueryWithSession(ctx context.Context, prompt string, sessionID string) error
+	QueryWithContent(ctx context.Context, content interface{}) error
 	QueryStream(ctx context.Context, messages <-chan StreamMessage) error
 	ReceiveMessages(ctx context.Context) <-chan Message
 	ReceiveResponse(ctx context.Context) MessageIterator
@@ -471,6 +472,39 @@ func (c *ClientImpl) queryWithSession(ctx context.Context, prompt string, sessio
 	}
 
 	// Send message via transport (without holding mutex to avoid blocking other operations)
+	return transport.SendMessage(ctx, streamMsg)
+}
+
+// QueryWithContent sends a message with structured content (text + images).
+// Content can be a string (plain text) or []ContentBlock (multi-modal).
+func (c *ClientImpl) QueryWithContent(ctx context.Context, content interface{}) error {
+	return c.queryWithContent(ctx, content, defaultSessionID)
+}
+
+func (c *ClientImpl) queryWithContent(ctx context.Context, content interface{}, sessionID string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	transport, err := c.liveTransport()
+	if err != nil {
+		return err
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	streamMsg := StreamMessage{
+		Type: "user",
+		Message: map[string]interface{}{
+			"role":    "user",
+			"content": content,
+		},
+		ParentToolUseID: nil,
+		SessionID:       sessionID,
+	}
+
 	return transport.SendMessage(ctx, streamMsg)
 }
 
