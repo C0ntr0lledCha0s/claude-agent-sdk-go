@@ -86,12 +86,19 @@ const (
 	RateLimitStatusAllowed = shared.RateLimitStatusAllowed
 )
 
+// ImageBlock represents an image content block.
+type ImageBlock = shared.ImageBlock
+
+// ImageSource describes the source data for an image content block.
+type ImageSource = shared.ImageSource
+
 // Re-export content block type constants
 const (
 	ContentBlockTypeText       = shared.ContentBlockTypeText
 	ContentBlockTypeThinking   = shared.ContentBlockTypeThinking
 	ContentBlockTypeToolUse    = shared.ContentBlockTypeToolUse
 	ContentBlockTypeToolResult = shared.ContentBlockTypeToolResult
+	ContentBlockTypeImage      = shared.ContentBlockTypeImage
 )
 
 // Re-export stream event type constants for Event["type"] discrimination.
