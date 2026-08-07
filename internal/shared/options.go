@@ -23,6 +23,10 @@ const (
 	PermissionModePlan PermissionMode = "plan"
 	// PermissionModeBypassPermissions bypasses all permission checks.
 	PermissionModeBypassPermissions PermissionMode = "bypassPermissions"
+	// PermissionModeAuto auto-approves tool calls that pass the CLI's
+	// background safety checks and prompts for the rest.
+	// Requires Claude Code v2.1.200 or later.
+	PermissionModeAuto PermissionMode = "auto"
 )
 
 // SdkBeta represents a beta feature identifier.
