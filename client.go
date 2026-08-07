@@ -28,7 +28,8 @@ type Client interface {
 	SetModel(ctx context.Context, model *string) error
 	// SetPermissionMode changes the permission mode during a streaming session.
 	// Valid modes: PermissionModeDefault, PermissionModeAcceptEdits,
-	// PermissionModePlan, PermissionModeBypassPermissions.
+	// PermissionModePlan, PermissionModeBypassPermissions,
+	// PermissionModeAuto (Claude Code v2.1.200+).
 	// Only works in streaming mode (after Connect()).
 	SetPermissionMode(ctx context.Context, mode PermissionMode) error
 	// RewindFiles reverts tracked files to their state at a specific user message.
@@ -214,6 +215,7 @@ func (c *ClientImpl) prepareOptions() error {
 			PermissionModeAcceptEdits:       true,
 			PermissionModePlan:              true,
 			PermissionModeBypassPermissions: true,
+			PermissionModeAuto:              true,
 		}
 		if !validModes[*c.options.PermissionMode] {
 			return fmt.Errorf("invalid permission mode: %s", string(*c.options.PermissionMode))
@@ -524,7 +526,8 @@ func (c *ClientImpl) SetModel(ctx context.Context, model *string) error {
 
 // SetPermissionMode changes the permission mode during a streaming session.
 // Valid modes: PermissionModeDefault, PermissionModeAcceptEdits,
-// PermissionModePlan, PermissionModeBypassPermissions.
+// PermissionModePlan, PermissionModeBypassPermissions,
+// PermissionModeAuto (Claude Code v2.1.200+).
 // Returns error if not connected or if the control request fails.
 //
 // Example - Enable auto-accept for edits:

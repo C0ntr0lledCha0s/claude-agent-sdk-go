@@ -2993,3 +2993,37 @@ func testClientGetMcpStatusTransportError(t *testing.T) {
 		t.Errorf("expected transport error, got: %v", err)
 	}
 }
+
+// TestClientPermissionModeAutoAccepted verifies Connect-time validation
+// accepts PermissionModeAuto (Claude Code v2.1.200+).
+func TestClientPermissionModeAutoAccepted(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newClientMockTransport()
+	client := NewClientWithTransport(transport, WithPermissionMode(PermissionModeAuto))
+	defer disconnectClientSafely(t, client)
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect with PermissionModeAuto should pass validation, got: %v", err)
+	}
+}
+
+// TestClientPermissionModeUnknownRejected verifies Connect-time validation
+// still rejects modes outside the known set.
+func TestClientPermissionModeUnknownRejected(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newClientMockTransport()
+	client := NewClientWithTransport(transport, WithPermissionMode(PermissionMode("yolo")))
+	defer disconnectClientSafely(t, client)
+
+	err := client.Connect(ctx)
+	if err == nil {
+		t.Fatal("Connect with an unknown permission mode should fail validation")
+	}
+	if !strings.Contains(err.Error(), "invalid permission mode") {
+		t.Errorf("expected invalid permission mode error, got: %v", err)
+	}
+}

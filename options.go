@@ -97,6 +97,7 @@ const (
 	PermissionModeAcceptEdits       = shared.PermissionModeAcceptEdits
 	PermissionModePlan              = shared.PermissionModePlan
 	PermissionModeBypassPermissions = shared.PermissionModeBypassPermissions
+	PermissionModeAuto              = shared.PermissionModeAuto
 	McpServerTypeStdio              = shared.McpServerTypeStdio
 	McpServerTypeSSE                = shared.McpServerTypeSSE
 	McpServerTypeHTTP               = shared.McpServerTypeHTTP
