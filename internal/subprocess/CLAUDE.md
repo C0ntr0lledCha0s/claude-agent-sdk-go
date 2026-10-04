@@ -22,7 +22,7 @@ subprocess/
 ├── config_test.go        # Environment and MCP config tests
 ├── agents_test.go        # agentsToMap stripping and protocol options wiring tests
 ├── lifecycle_test.go     # Wait ownership, fast-exit output drain, init race, connect cancellation tests
-├── mock_cli_test.go      # TestMain + os.Args[0] mock CLI (cross-platform, CLAUDE_SDK_TEST_MOCK_MODE); modes: default, long_running, should_fail, check_environment, invalid_output, with_control_protocol, with_stderr, init_error, burst_exit, exit_before_init, stdout_closed_alive, hang_init, early_error_result, two_permission_requests, exit_nonzero, error_result_exit, server_info, exit_clean, orphan_stdout, hold_stdout, ignore_sigterm, slow_exit_after_eof, stop_reading, fixed_size_line
+├── mock_cli_test.go      # TestMain + os.Args[0] mock CLI (cross-platform, CLAUDE_SDK_TEST_MOCK_MODE); modes: default, long_running, should_fail, check_environment, invalid_output, with_control_protocol, with_stderr, init_error, burst_exit, exit_before_init, stdout_closed_alive, hang_init, early_error_result, two_permission_requests, exit_nonzero, error_result_exit, server_info, exit_clean, orphan_stdout, hold_stdout, ignore_sigterm, slow_exit_after_eof, stop_reading, fixed_size_line, close_orphan_stdout, orphan_stdout_and_stderr, orphan_holder
 ├── shutdown_test.go      # Graceful shutdown order and timing tests (event log via CLAUDE_SDK_TEST_MOCK_EVENT_LOG)
 ├── protocol_adapter.go   # ProtocolAdapter for control.Transport interface
 └── protocol_adapter_test.go # Adapter tests

@@ -207,3 +207,64 @@ func assertGap(t *testing.T, name string, fromMs, toMs int64, minGap time.Durati
 		t.Errorf("%s gap = %v, want at least %v", name, gap, minGap)
 	}
 }
+
+// TestCloseDoesNotWaitForDescendantHoldingOutput verifies Close returns once
+// the CLI is reaped even when a descendant (an MCP server, a background shell)
+// inherited its stdout or stderr and still holds the pipe, so the readers never
+// see EOF. Python's close() waits for the process, not for the pipes.
+func TestCloseDoesNotWaitForDescendantHoldingOutput(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		options *shared.Options
+	}{
+		{"descendant_holds_stdout", mockModeCloseOrphanStdout, &shared.Options{}},
+		{
+			"descendant_holds_stdout_and_stderr_with_callback",
+			mockModeOrphanOutput,
+			&shared.Options{StderrCallback: func(string) {}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+			defer cancel()
+
+			pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+			t.Setenv(envMockPidFile, pidFile)
+			transport := New(newTransportMockCLIMode(t, tt.mode), tt.options, "sdk-go")
+			t.Cleanup(func() { killMockDescendant(t, pidFile) })
+			connectTransportSafely(ctx, t, transport)
+
+			select {
+			case <-transport.processDone:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the CLI did not exit after starting its descendant")
+			}
+
+			start := time.Now()
+			assertNoTransportError(t, transport.Close())
+			if duration := time.Since(start); duration > 3*time.Second {
+				t.Errorf("Close took %v with a descendant holding the output pipes, want under 3s", duration)
+			}
+		})
+	}
+}
+
+// killMockDescendant ends the descendant the orphan modes started, so it does
+// not outlive the test.
+func killMockDescendant(t *testing.T, pidFile string) {
+	t.Helper()
+	data, err := os.ReadFile(pidFile) //nolint:gosec // path is constructed from test temp dir
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return
+	}
+	if process, err := os.FindProcess(pid); err == nil {
+		_ = process.Kill()
+	}
+}

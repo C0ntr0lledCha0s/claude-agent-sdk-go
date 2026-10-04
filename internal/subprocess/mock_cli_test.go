@@ -43,6 +43,8 @@ const (
 	envMockMode = "CLAUDE_SDK_TEST_MOCK_MODE"
 	// envMockEventLog names a file where shutdown modes append "NAME <unix-ms>" lines.
 	envMockEventLog = "CLAUDE_SDK_TEST_MOCK_EVENT_LOG"
+	// envMockPidFile names a file where the orphan modes write their descendant's pid.
+	envMockPidFile = "CLAUDE_SDK_TEST_MOCK_PID_FILE"
 )
 
 // Mock modes. Order matches the TransportMockOption constructors above so the
@@ -76,6 +78,9 @@ const (
 	mockModeIgnoreInterrupt     = "ignore_interrupt"
 	mockModeExitOnInterrupt     = "exit_on_interrupt"
 	mockModeOverflowOnInterrupt = "overflow_on_interrupt"
+	mockModeCloseOrphanStdout   = "close_orphan_stdout"
+	mockModeOrphanOutput        = "orphan_stdout_and_stderr"
+	mockModeOrphanHolder        = "orphan_holder"
 )
 
 // Event names written to the mock event log.
@@ -366,6 +371,12 @@ func runShutdownMock(mode string) {
 		runMockOnInterrupt(func() { os.Exit(1) })
 	case mockModeOverflowOnInterrupt:
 		runMockOnInterrupt(func() { fmt.Println(strings.Repeat("x", overflowLineSize)) })
+	case mockModeCloseOrphanStdout:
+		runMockOrphan(false)
+	case mockModeOrphanOutput:
+		runMockOrphan(true)
+	case mockModeOrphanHolder:
+		time.Sleep(orphanHolderLifetime)
 	case mockModeStopReading:
 		answerInitialize()
 		// Never read stdin again, so the SDK's stdin writes block once the pipe is full.
@@ -479,6 +490,32 @@ func runMockOnInterrupt(onInterrupt func()) {
 			continue
 		}
 		fmt.Println(buildControlResponse(extractRequestID(line)))
+	}
+}
+
+// orphanHolderLifetime is how long the descendant started by the orphan modes
+// keeps its inherited output pipes open. It must outlast the 5 second wait a
+// Close that blocks on the readers would pay.
+const orphanHolderLifetime = 15 * time.Second
+
+// runMockOrphan answers initialize and starts a copy of the test binary that
+// inherits the CLI's stdout (and stderr when withStderr) and outlives it, like
+// an MCP server or background shell the CLI spawned. The CLI then exits at
+// once, so only the descendant still holds the pipes.
+func runMockOrphan(withStderr bool) {
+	answerInitialize()
+	holder := exec.Command(os.Args[0]) //nolint:gosec // re-execs the test binary as the descendant
+	holder.Env = append(os.Environ(), envMockMode+"="+mockModeOrphanHolder)
+	holder.Stdout = os.Stdout
+	if withStderr {
+		holder.Stderr = os.Stderr
+	}
+	if err := holder.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "start descendant: %v\n", err)
+		os.Exit(2)
+	}
+	if path := os.Getenv(envMockPidFile); path != "" {
+		_ = os.WriteFile(path, []byte(fmt.Sprint(holder.Process.Pid)), 0o600)
 	}
 }
 

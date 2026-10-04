@@ -23,6 +23,9 @@ const (
 	channelBufferSize = 10
 	// terminationTimeoutSeconds is the timeout for graceful process termination.
 	terminationTimeoutSeconds = 5
+	// pipeDrainGrace is how long Close waits, after the CLI is reaped, for the
+	// stderr callback to deliver what is already in its pipe.
+	pipeDrainGrace = 500 * time.Millisecond
 	// windowsOS is the GOOS value for Windows platform.
 	windowsOS = "windows"
 )
@@ -444,7 +447,15 @@ func (t *Transport) teardownLocked() error {
 		t.cancel()
 	}
 
-	// Wait for goroutines to finish with timeout.
+	// The CLI is reaped, so stdout has nothing left that a reader may still
+	// deliver. A descendant that inherited the pipe would keep handleStdout
+	// blocked in its read, so close the read end instead of waiting for EOF.
+	if t.stdout != nil {
+		_ = t.stdout.Close()
+	}
+
+	// The stderr callback gets a bounded chance to drain its pipe, which a
+	// descendant may also hold open; cleanup closes it below.
 	done := make(chan struct{})
 	go func() {
 		t.wg.Wait()
@@ -452,8 +463,7 @@ func (t *Transport) teardownLocked() error {
 	}()
 	select {
 	case <-done:
-	case <-time.After(terminationTimeoutSeconds * time.Second):
-		// cleanup closes the pipes below, which ends the readers.
+	case <-time.After(pipeDrainGrace):
 	}
 
 	t.cleanup()
