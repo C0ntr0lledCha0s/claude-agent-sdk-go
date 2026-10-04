@@ -292,7 +292,7 @@ type Client interface {
 **Diagnostics**
 - `GetStreamIssues()` - Get list of stream problems
 - `GetStreamStats()` - Get stream statistics
-- `GetServerInfo()` - Get CLI server information
+- `GetServerInfo()` - Get the CLI's initialize response (commands, output styles, models, account)
 
 **Process Lifecycle**
 - `Done()` - Channel that closes when the CLI process exits

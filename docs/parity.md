@@ -90,7 +90,7 @@ These contributor PRs are open and not merged. The tracker rows keep their statu
 | `set_model(model)` | `SetModel(ctx, model)` | PARITY |
 | `rewind_files(uuid)` | `RewindFiles(ctx, messageUUID)` | PARITY |
 | `get_mcp_status()` | `GetMcpStatus(ctx)` | PARITY |
-| `get_server_info()` | `GetServerInfo(ctx)` | PARTIAL (Go returns fixed `connected` and `transport_type` keys; Python returns the CLI initialize response, `client.py:540-564`; open Go PR #166) |
+| `get_server_info()` | `GetServerInfo(ctx)` | PARITY (returns the initialize response; nil for a custom transport that does not keep it) |
 | `disconnect()` | `Disconnect()` | PARITY |
 | `reconnect_mcp_server(name)` | - | PENDING (README #10) |
 | `toggle_mcp_server(name, enabled)` | - | PENDING (README #10) |

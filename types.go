@@ -135,6 +135,10 @@ const (
 // Done() <-chan struct{} and Err() error with the semantics of Client.Done
 // and Client.Err. The subprocess transport does; for one that does not,
 // Client.Done closes on Disconnect.
+//
+// A Transport can also keep the CLI's initialize response by implementing
+// InitializationResult() map[string]interface{}; Client.GetServerInfo returns
+// it. The subprocess transport does.
 type Transport interface {
 	// Connect starts the CLI. ctx bounds only the connect step; the CLI
 	// runs until Close.

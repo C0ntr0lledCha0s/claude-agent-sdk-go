@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -602,6 +603,72 @@ func testInitializeSuccess(t *testing.T) {
 
 	if resp == nil {
 		t.Fatal("expected initialize response, got nil")
+	}
+}
+
+// TestInitializationResultKeepsFullResponse verifies that the whole initialize
+// response is kept, not only supported_commands (Python:
+// Query._initialization_result, returned by get_server_info).
+func TestInitializationResultKeepsFullResponse(t *testing.T) {
+	ctx, cancel := setupControlTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newControlMockTransport()
+	protocol := NewProtocol(transport)
+	assertControlNoError(t, protocol.Start(ctx))
+	defer func() { _ = protocol.Close() }()
+
+	if got := protocol.InitializationResult(); got != nil {
+		t.Fatalf("InitializationResult() before Initialize = %v, want nil", got)
+	}
+
+	response := map[string]any{
+		"commands": []any{
+			map[string]any{"name": "compact", "description": "Compact the conversation", "argumentHint": ""},
+		},
+		"output_style":            "default",
+		"available_output_styles": []any{"default", "Explanatory"},
+		"models": []any{
+			map[string]any{
+				"value": "opus[1m]", "resolvedModel": "claude-opus-5-5[1m]", "displayName": "Opus (1M context)",
+				"description": "Most capable", "supportsEffort": true, "supportedEffortLevels": []any{"low", "high"},
+			},
+			map[string]any{"value": "haiku", "displayName": "Haiku", "description": "Fastest"},
+		},
+		"account": map[string]any{"subscriptionType": "max"},
+	}
+	go respondToFirstRequest(transport, response)
+
+	_, err := protocol.Initialize(ctx)
+	assertControlNoError(t, err)
+
+	got := protocol.InitializationResult()
+	if !reflect.DeepEqual(got, response) {
+		t.Fatalf("InitializationResult() = %v, want %v", got, response)
+	}
+
+	got["models"].([]any)[0].(map[string]any)["value"] = "changed"
+	delete(got, "account")
+	if again := protocol.InitializationResult(); !reflect.DeepEqual(again, response) {
+		t.Fatalf("InitializationResult() after a caller modified a result = %v, want %v", again, response)
+	}
+}
+
+// respondToFirstRequest answers the first control request the protocol writes.
+func respondToFirstRequest(transport *controlMockTransport, response any) {
+	for {
+		transport.mu.Lock()
+		if len(transport.writtenData) > 0 {
+			var req SDKControlRequest
+			err := json.Unmarshal(transport.writtenData[0], &req)
+			transport.mu.Unlock()
+			if err == nil {
+				transport.injectResponse(req.RequestID, response)
+			}
+			return
+		}
+		transport.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

@@ -46,6 +46,7 @@ type Protocol struct {
 	initOnce     sync.Once
 	initErr      error
 	initResponse *InitializeResponse
+	initResult   map[string]any // the whole initialize response
 	initErrChan  chan error
 	closed       bool
 	started      bool
@@ -527,12 +528,11 @@ func (p *Protocol) Initialize(ctx context.Context) (*InitializeResponse, error) 
 
 		// Parse response
 		var initResp InitializeResponse
-		if resultMap, ok := result.(map[string]any); ok {
-			if cmds, ok := resultMap["supported_commands"].([]any); ok {
-				for _, cmd := range cmds {
-					if cmdStr, ok := cmd.(string); ok {
-						initResp.SupportedCommands = append(initResp.SupportedCommands, cmdStr)
-					}
+		resultMap, _ := result.(map[string]any)
+		if cmds, ok := resultMap["supported_commands"].([]any); ok {
+			for _, cmd := range cmds {
+				if cmdStr, ok := cmd.(string); ok {
+					initResp.SupportedCommands = append(initResp.SupportedCommands, cmdStr)
 				}
 			}
 		}
@@ -540,6 +540,7 @@ func (p *Protocol) Initialize(ctx context.Context) (*InitializeResponse, error) 
 		p.mu.Lock()
 		p.initialized = true
 		p.initResponse = &initResp
+		p.initResult = resultMap
 		p.mu.Unlock()
 	})
 
@@ -549,6 +550,39 @@ func (p *Protocol) Initialize(ctx context.Context) (*InitializeResponse, error) 
 	p.mu.Unlock()
 
 	return resp, err
+}
+
+// InitializationResult returns the initialize response the CLI sent: its
+// commands, output styles, models, account and other capabilities (Python:
+// Query._initialization_result). It is nil before the handshake completes.
+// Each call returns a copy the caller may modify.
+func (p *Protocol) InitializationResult() map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.initResult == nil {
+		return nil
+	}
+	return copyJSONValue(p.initResult).(map[string]any)
+}
+
+// copyJSONValue deep-copies a value decoded by encoding/json into any.
+func copyJSONValue(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(v))
+		for k, e := range v {
+			m[k] = copyJSONValue(e)
+		}
+		return m
+	case []any:
+		s := make([]any, len(v))
+		for i, e := range v {
+			s[i] = copyJSONValue(e)
+		}
+		return s
+	default:
+		return v
+	}
 }
 
 // IsInitialized reports whether the initialize handshake completed.

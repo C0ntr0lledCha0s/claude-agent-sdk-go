@@ -117,6 +117,16 @@ func (t *Transport) GetMcpStatus(ctx context.Context) (*control.McpStatusRespons
 	return protocol.GetMcpStatus(ctx)
 }
 
+// InitializationResult returns the initialize response the CLI sent during
+// Connect, or nil when the transport is not connected.
+func (t *Transport) InitializationResult() map[string]any {
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return nil
+	}
+	return protocol.InitializationResult()
+}
+
 // buildProtocolOptions constructs control protocol options from transport configuration.
 func (t *Transport) buildProtocolOptions() []control.ProtocolOption {
 	var opts []control.ProtocolOption

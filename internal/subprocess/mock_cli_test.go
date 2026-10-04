@@ -71,6 +71,7 @@ const (
 	mockModeExitClean           = "exit_clean"
 	mockModeOrphanStdout        = "orphan_stdout"
 	mockModeHoldStdout          = "hold_stdout"
+	mockModeServerInfo          = "server_info"
 )
 
 // Event names written to the mock event log.
@@ -329,8 +330,8 @@ func runMockTwoPermissionRequests() {
 // slowExitDelay is how long slow_exit_after_eof keeps running after stdin EOF.
 const slowExitDelay = 1500 * time.Millisecond
 
-// runShutdownMock runs the shutdown and exit modes and exits 2 for an unknown
-// mode. Split from runMockCLI to keep its complexity flat.
+// runShutdownMock runs the shutdown, exit and server_info modes and exits 2
+// for an unknown mode. Split from runMockCLI to keep its complexity flat.
 func runShutdownMock(mode string) {
 	switch mode {
 	case mockModeExitClean:
@@ -339,6 +340,8 @@ func runShutdownMock(mode string) {
 		runMockOrphanStdout()
 	case mockModeHoldStdout:
 		time.Sleep(orphanHoldTime)
+	case mockModeServerInfo:
+		runMockServerInfo()
 	case mockModeIgnoreSIGTERM:
 		runMockIgnoreSIGTERM()
 	case mockModeSlowExitAfterEOF:
@@ -392,6 +395,31 @@ func runMockOrphanStdout() {
 		fmt.Fprintf(os.Stderr, "start descendant: %v\n", err)
 	}
 	os.Exit(mockCrashExitCode)
+}
+
+// mockInitializeResponse is the initialize response of the server_info mode,
+// in the shape the CLI sends.
+const mockInitializeResponse = `{"commands":[{"name":"compact","description":"Compact the conversation","argumentHint":""}],` +
+	`"output_style":"default","available_output_styles":["default","Explanatory"],` +
+	`"models":[{"value":"opus[1m]","resolvedModel":"claude-opus-5-5[1m]","displayName":"Opus (1M context)",` +
+	`"description":"Most capable","supportsEffort":true,"supportedEffortLevels":["low","high"]},` +
+	`{"value":"haiku","displayName":"Haiku","description":"Fastest"}],` +
+	`"account":{"subscriptionType":"max"}}`
+
+// runMockServerInfo answers initialize with mockInitializeResponse, then
+// echoes control requests.
+func runMockServerInfo() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Printf(`{"type":"control_response","response":{"subtype":"success","request_id":%q,"response":%s}}`+"\n",
+				extractRequestID(line), mockInitializeResponse)
+			break
+		}
+	}
+	controlEchoLoop(os.Stdin, os.Stdout)
 }
 
 // runMockIgnoreSIGTERM logs and ignores SIGTERM, so only SIGKILL ends it.

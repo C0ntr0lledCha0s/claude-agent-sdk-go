@@ -494,7 +494,7 @@ func (c *ClientImpl) GetStreamStats() StreamStats
 
 #### `GetServerInfo()`
 
-Get diagnostic information from the CLI.
+Get the initialize response the CLI sent during `Connect()`, as decoded JSON (Python `get_server_info()`): its slash `commands`, `output_style` and `available_output_styles`, the `models` it offers (each with `value`, `displayName`, `description` and, when supported, `supportsEffort` and `supportedEffortLevels`), `account` and other capabilities. The keys are the CLI's own and vary by CLI version. Each call returns a copy. Returns nil with a custom `Transport` that does not implement `InitializationResult()`, and an error when not connected.
 
 ```go
 func (c *ClientImpl) GetServerInfo(ctx context.Context) (map[string]interface{}, error)

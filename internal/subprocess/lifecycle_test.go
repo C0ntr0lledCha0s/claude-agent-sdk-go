@@ -2,7 +2,9 @@ package subprocess
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -430,4 +432,33 @@ func killedExitCode() int {
 		return 1
 	}
 	return -1
+}
+
+// TestTransportInitializationResult verifies that the initialize response the
+// CLI sent during Connect is kept whole, and dropped by Close.
+func TestTransportInitializationResult(t *testing.T) {
+	ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+	defer cancel()
+
+	transport := New(newTransportMockCLIMode(t, mockModeServerInfo), &shared.Options{}, "sdk-go")
+	if got := transport.InitializationResult(); got != nil {
+		t.Fatalf("InitializationResult() before Connect = %v, want nil", got)
+	}
+	t.Cleanup(func() { _ = transport.Close() })
+	connectTransportSafely(ctx, t, transport)
+
+	var want map[string]any
+	if err := json.Unmarshal([]byte(mockInitializeResponse), &want); err != nil {
+		t.Fatalf("decode mockInitializeResponse: %v", err)
+	}
+	if got := transport.InitializationResult(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("InitializationResult() = %v, want %v", got, want)
+	}
+
+	if err := transport.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := transport.InitializationResult(); got != nil {
+		t.Fatalf("InitializationResult() after Close = %v, want nil", got)
+	}
 }

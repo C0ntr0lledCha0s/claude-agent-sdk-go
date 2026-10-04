@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -1533,6 +1534,40 @@ func (p *processMockTransport) Err() error {
 	return p.exitErr
 }
 
+// serverInfoTransport is a clientMockTransport that keeps an initialize
+// response, like the subprocess transport.
+type serverInfoTransport struct {
+	*clientMockTransport
+}
+
+func newServerInfoTransport() Transport {
+	return &serverInfoTransport{clientMockTransport: newClientMockTransport()}
+}
+
+func (s *serverInfoTransport) InitializationResult() map[string]interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.connected {
+		return nil
+	}
+	return testInitializeResponse()
+}
+
+// testInitializeResponse is an initialize response in the shape the CLI sends.
+func testInitializeResponse() map[string]interface{} {
+	return map[string]interface{}{
+		"commands":                []interface{}{map[string]interface{}{"name": "compact", "description": "Compact the conversation"}},
+		"output_style":            "default",
+		"available_output_styles": []interface{}{"default", "Explanatory"},
+		"models": []interface{}{
+			map[string]interface{}{
+				"value": "opus[1m]", "displayName": "Opus (1M context)", "description": "Most capable",
+				"supportsEffort": true, "supportedEffortLevels": []interface{}{"low", "high"},
+			},
+		},
+	}
+}
+
 // Streamlined Mock Transport Options - reduced from 11 to 6 essential functions
 type ClientMockTransportOption func(*clientMockTransport)
 
@@ -2674,114 +2709,25 @@ func TestClientQueryNotConnectedError(t *testing.T) {
 	}
 }
 
-// TestGetServerInfo tests the GetServerInfo method for diagnostic information retrieval.
+// TestGetServerInfo verifies that GetServerInfo returns the initialize
+// response the CLI sent (Python get_server_info returns
+// Query._initialization_result), and an error when not connected.
 func TestGetServerInfo(t *testing.T) {
 	tests := []struct {
-		name     string
-		setup    func() (*clientMockTransport, Client)
-		connect  bool
-		wantErr  bool
-		validate func(*testing.T, map[string]interface{}, error)
+		name       string
+		transport  func() Transport
+		connect    bool
+		disconnect bool
+		query      bool
+		wantErr    bool
+		want       map[string]interface{}
 	}{
-		{
-			name: "returns_error_when_not_connected",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: false,
-			wantErr: true,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err == nil {
-					t.Error("Expected error when not connected")
-					return
-				}
-				if !strings.Contains(err.Error(), "not connected") {
-					t.Errorf("Expected error to contain 'not connected', got: %v", err)
-				}
-				if info != nil {
-					t.Errorf("Expected nil info when not connected, got: %v", info)
-				}
-			},
-		},
-		{
-			name: "returns_info_when_connected",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: true,
-			wantErr: false,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err != nil {
-					t.Errorf("Expected no error, got: %v", err)
-					return
-				}
-				if info == nil {
-					t.Error("Expected info map, got nil")
-					return
-				}
-				// Verify expected fields
-				if connected, ok := info["connected"].(bool); !ok || !connected {
-					t.Errorf("Expected connected=true, got: %v", info["connected"])
-				}
-				if transportType, ok := info["transport_type"].(string); !ok || transportType != "subprocess" {
-					t.Errorf("Expected transport_type='subprocess', got: %v", info["transport_type"])
-				}
-			},
-		},
-		{
-			name: "returns_info_after_query",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: true,
-			wantErr: false,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err != nil {
-					t.Errorf("Expected no error after query, got: %v", err)
-					return
-				}
-				if info == nil {
-					t.Error("Expected info map after query, got nil")
-					return
-				}
-				// Should still show connected after operations
-				if connected, ok := info["connected"].(bool); !ok || !connected {
-					t.Errorf("Expected connected=true after query, got: %v", info["connected"])
-				}
-			},
-		},
-		{
-			name: "returns_error_after_disconnect",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: true, // Will connect then disconnect before calling GetServerInfo
-			wantErr: true,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err == nil {
-					t.Error("Expected error after disconnect")
-					return
-				}
-				if !strings.Contains(err.Error(), "not connected") {
-					t.Errorf("Expected error to contain 'not connected', got: %v", err)
-				}
-				if info != nil {
-					t.Errorf("Expected nil info after disconnect, got: %v", info)
-				}
-			},
-		},
+		{name: "not_connected", transport: newServerInfoTransport, wantErr: true},
+		{name: "initialize_response", transport: newServerInfoTransport, connect: true, want: testInitializeResponse()},
+		{name: "after_query", transport: newServerInfoTransport, connect: true, query: true, want: testInitializeResponse()},
+		{name: "after_disconnect", transport: newServerInfoTransport, connect: true, disconnect: true, wantErr: true},
+		// A transport that does not keep the response has no server info (Python: None).
+		{name: "custom_transport", transport: func() Transport { return newClientMockTransport() }, connect: true},
 	}
 
 	for _, test := range tests {
@@ -2789,26 +2735,24 @@ func TestGetServerInfo(t *testing.T) {
 			ctx, cancel := setupClientTestContext(t, 5*time.Second)
 			defer cancel()
 
-			_, client := test.setup()
+			client := setupClientForTest(t, test.transport())
 			defer disconnectClientSafely(t, client)
 
 			if test.connect {
 				connectClientSafely(ctx, t, client)
 			}
-
-			// For the "after query" test, send a query first
-			if test.name == "returns_info_after_query" {
-				err := client.Query(ctx, "test message")
-				assertNoError(t, err)
+			if test.query {
+				assertNoError(t, client.Query(ctx, "test message"))
 			}
-
-			// For the "after disconnect" test, disconnect before calling GetServerInfo
-			if test.name == "returns_error_after_disconnect" {
+			if test.disconnect {
 				disconnectClientSafely(t, client)
 			}
 
 			info, err := client.GetServerInfo(ctx)
-			test.validate(t, info, err)
+			assertClientError(t, err, test.wantErr, "not connected")
+			if !reflect.DeepEqual(info, test.want) {
+				t.Errorf("GetServerInfo() = %v, want %v", info, test.want)
+			}
 		})
 	}
 }
@@ -2818,14 +2762,13 @@ func TestGetServerInfoConcurrent(t *testing.T) {
 	ctx, cancel := setupClientTestContext(t, 15*time.Second)
 	defer cancel()
 
-	transport := newClientMockTransport()
-	client := setupClientForTest(t, transport)
+	client := setupClientForTest(t, newServerInfoTransport())
 	defer disconnectClientSafely(t, client)
 
 	connectClientSafely(ctx, t, client)
 
 	const numGoroutines = 10
-	errors := make(chan error, numGoroutines)
+	errs := make(chan error, numGoroutines)
 	results := make(chan map[string]interface{}, numGoroutines)
 
 	var wg sync.WaitGroup
@@ -2835,7 +2778,7 @@ func TestGetServerInfoConcurrent(t *testing.T) {
 			defer wg.Done()
 			info, err := client.GetServerInfo(ctx)
 			if err != nil {
-				errors <- err
+				errs <- err
 				return
 			}
 			results <- info
@@ -2843,25 +2786,26 @@ func TestGetServerInfoConcurrent(t *testing.T) {
 	}
 
 	wg.Wait()
-	close(errors)
+	close(errs)
 	close(results)
 
-	// Check for errors
-	for err := range errors {
+	for err := range errs {
 		t.Errorf("Concurrent GetServerInfo error: %v", err)
 	}
-
-	// Verify all results are consistent
-	var prevConnected bool
-	first := true
 	for info := range results {
-		connected := info["connected"].(bool)
-		if first {
-			prevConnected = connected
-			first = false
-		} else if connected != prevConnected {
-			t.Error("Inconsistent connected state across concurrent calls")
+		if !reflect.DeepEqual(info, testInitializeResponse()) {
+			t.Errorf("GetServerInfo() = %v, want the initialize response", info)
 		}
+	}
+}
+
+// TestSubprocessTransportKeepsServerInfo guards the optional interface that
+// GetServerInfo type-asserts: if the subprocess transport stopped satisfying
+// it, GetServerInfo would silently return nil.
+func TestSubprocessTransportKeepsServerInfo(t *testing.T) {
+	var transport Transport = subprocess.New("claude", NewOptions(), "sdk-go-client")
+	if _, ok := transport.(serverInfoSource); !ok {
+		t.Fatal("subprocess.Transport does not implement serverInfoSource")
 	}
 }
 

@@ -38,6 +38,7 @@ control/
 <!-- AUTO-MANAGED: conventions -->
 ## Module-Specific Conventions
 
+- Initialize result: `Initialize()` keeps the whole response map in `initResult` (Python `Query._initialization_result`); `InitializationResult()` returns a deep copy via `copyJSONValue`, nil before the handshake; `InitializeResponse` still decodes only `supported_commands`
 - Request correlation: Use unique request IDs for response matching
 - Thread safety: All state access protected by mutex
 - Timeout handling: Default 60s init timeout, configurable via `WithInitTimeout`

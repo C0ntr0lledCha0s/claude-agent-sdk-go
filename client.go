@@ -794,16 +794,19 @@ func (c *ClientImpl) GetStreamStats() StreamStats {
 	return validator.GetStats()
 }
 
-// GetServerInfo returns diagnostic information about the client and its connection.
-// This provides useful information for debugging, health checks, and support scenarios.
+// serverInfoSource is implemented by transports that keep the initialize
+// response the CLI sent during Connect.
+type serverInfoSource interface {
+	InitializationResult() map[string]interface{}
+}
+
+// GetServerInfo returns the initialize response the CLI sent during Connect,
+// as decoded JSON: its commands, output styles, models, account and other
+// capabilities (Python: get_server_info). Each call returns a copy. It returns
+// nil when the transport does not keep the response, and an error when the
+// client is not connected.
 //
 // This method is thread-safe and can be called concurrently from multiple goroutines.
-//
-// Returns a map containing:
-//   - "connected": bool - Whether the client is currently connected
-//   - "transport_type": string - The type of transport being used (e.g., "subprocess")
-//
-// Returns an error if the client is not connected.
 //
 // Example:
 //
@@ -812,8 +815,9 @@ func (c *ClientImpl) GetStreamStats() StreamStats {
 //	    log.Printf("Client not connected: %v", err)
 //	    return
 //	}
-//	fmt.Printf("Connected: %v, Transport: %s\n",
-//	    info["connected"], info["transport_type"])
+//	if models, ok := info["models"].([]interface{}); ok {
+//	    fmt.Printf("Models available: %d\n", len(models))
+//	}
 func (c *ClientImpl) GetServerInfo(_ context.Context) (map[string]interface{}, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -822,10 +826,8 @@ func (c *ClientImpl) GetServerInfo(_ context.Context) (map[string]interface{}, e
 		return nil, errClientNotConnected
 	}
 
-	info := map[string]interface{}{
-		"connected":      true,
-		"transport_type": "subprocess",
+	if source, ok := c.transport.(serverInfoSource); ok {
+		return source.InitializationResult(), nil
 	}
-
-	return info, nil
+	return nil, nil
 }
