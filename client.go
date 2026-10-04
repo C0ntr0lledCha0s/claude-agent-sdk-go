@@ -88,8 +88,8 @@ type ClientImpl struct {
 	options         *Options
 	connected       bool
 	msgChan         <-chan Message
-	errChan         <-chan error
-	streamErrChan   chan error // writable; receives errors from QueryStream goroutine
+	stream          *streamReader // shared by every ReceiveResponse iterator
+	streamErrChan   chan error    // writable; receives errors from QueryStream goroutine
 	// disconnected closes on Disconnect. Done returns it when the transport
 	// cannot report its process.
 	disconnected chan struct{}
@@ -358,7 +358,9 @@ func (c *ClientImpl) Connect(ctx context.Context, _ ...StreamMessage) error {
 	}
 
 	// Get message channels
-	c.msgChan, c.errChan = c.transport.ReceiveMessages(ctx)
+	msgChan, errChan := c.transport.ReceiveMessages(ctx)
+	c.msgChan = msgChan
+	c.stream = newStreamReader(msgChan, errChan)
 	c.streamErrChan = make(chan error, 1)
 	c.disconnected = make(chan struct{})
 
@@ -382,7 +384,7 @@ func (c *ClientImpl) Disconnect() error {
 	c.connected = false
 	c.transport = nil
 	c.msgChan = nil
-	c.errChan = nil
+	c.stream = nil
 	c.streamErrChan = nil
 	return nil
 }
@@ -513,19 +515,18 @@ func (c *ClientImpl) ReceiveResponse(_ context.Context) MessageIterator {
 	c.mu.RLock()
 	connected := c.connected
 	msgChan := c.msgChan
-	errChan := c.errChan
+	stream := c.stream
 	streamErrChan := c.streamErrChan
 	c.mu.RUnlock()
 
 	if !connected || msgChan == nil {
 		closed := make(chan Message)
 		close(closed)
-		return &clientIterator{msgChan: closed, errChan: make(chan error)}
+		return &clientIterator{stream: newStreamReader(closed, make(chan error))}
 	}
 
 	return &clientIterator{
-		msgChan:       msgChan,
-		errChan:       errChan,
+		stream:        stream,
 		streamErrChan: streamErrChan,
 	}
 }
@@ -692,8 +693,7 @@ func (c *ClientImpl) liveTransportLocked() (Transport, error) {
 
 // clientIterator implements MessageIterator for client message reception
 type clientIterator struct {
-	msgChan       <-chan Message
-	errChan       <-chan error
+	stream        *streamReader
 	streamErrChan <-chan error
 	mu            sync.Mutex
 	closed        bool
@@ -707,40 +707,16 @@ func (ci *clientIterator) Next(ctx context.Context) (Message, error) {
 	}
 	ci.mu.Unlock()
 
-	// A closed error channel only means "no more errors": nil it for this
-	// call so it neither returns (nil, nil) nor wins over buffered messages.
-	errChan, streamErrChan := ci.errChan, ci.streamErrChan
-	for {
-		select {
-		case msg, ok := <-ci.msgChan:
-			if !ok {
-				ci.markClosed()
-				return nil, ErrNoMoreMessages
-			}
-			// The turn ends at its ResultMessage (Python receive_response); the channel stays open for the next turn.
-			if _, isResult := msg.(*ResultMessage); isResult {
-				ci.markClosed()
-			}
-			return msg, nil
-		case err, ok := <-errChan:
-			if !ok {
-				errChan = nil
-				continue
-			}
-			ci.markClosed()
-			return nil, err
-		case err, ok := <-streamErrChan:
-			if !ok {
-				streamErrChan = nil
-				continue
-			}
-			ci.markClosed()
-			return nil, err
-		case <-ctx.Done():
-			ci.markClosed()
-			return nil, ctx.Err()
-		}
+	msg, err := ci.stream.next(ctx, ci.streamErrChan)
+	if err != nil {
+		ci.markClosed()
+		return nil, err
 	}
+	// The turn ends at its ResultMessage (Python receive_response); the channel stays open for the next turn.
+	if _, isResult := msg.(*ResultMessage); isResult {
+		ci.markClosed()
+	}
+	return msg, nil
 }
 
 func (ci *clientIterator) markClosed() {

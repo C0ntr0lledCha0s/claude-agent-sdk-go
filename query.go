@@ -76,8 +76,7 @@ type queryIterator struct {
 	ctx                context.Context
 	options            *Options
 	started            bool
-	msgChan            <-chan Message
-	errChan            <-chan error
+	stream             *streamReader
 	mu                 sync.Mutex
 	closed             bool
 	closeOnce          sync.Once
@@ -106,29 +105,13 @@ func (qi *queryIterator) Next(_ context.Context) (Message, error) {
 
 	// Every terminal path closes the transport, so a caller that drains the
 	// iterator without calling Close leaks nothing (Python: finally query.close()).
-	// A closed errChan only means "no more errors", so keep reading msgChan.
-	errChan := qi.errChan
-	for {
-		select {
-		case msg, ok := <-qi.msgChan:
-			if !ok {
-				_ = qi.Close()
-				return nil, ErrNoMoreMessages
-			}
-			qi.maybeEndInputAfterResult(msg)
-			return msg, nil
-		case err, ok := <-errChan:
-			if !ok {
-				errChan = nil
-				continue
-			}
-			_ = qi.Close()
-			return nil, err
-		case <-qi.ctx.Done():
-			_ = qi.Close()
-			return nil, qi.ctx.Err()
-		}
+	msg, err := qi.stream.next(qi.ctx, nil)
+	if err != nil {
+		_ = qi.Close()
+		return nil, err
 	}
+	qi.maybeEndInputAfterResult(msg)
+	return msg, nil
 }
 
 // maybeEndInputAfterResult closes the transport stdin write side after the
@@ -181,8 +164,7 @@ func (qi *queryIterator) start() error {
 	qi.watchContext()
 
 	msgChan, errChan := qi.transport.ReceiveMessages(qi.ctx)
-	qi.msgChan = msgChan
-	qi.errChan = errChan
+	qi.stream = newStreamReader(msgChan, errChan)
 
 	// Write the prompt as a user-message JSON line on stdin. The wire
 	// body always carries `session_id` and `parent_tool_use_id` keys

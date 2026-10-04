@@ -46,6 +46,51 @@ func TestTransportReceivesAllOutputAfterFastExit(t *testing.T) {
 	}
 }
 
+// TestTransportSendsExitErrorAfterLastMessage verifies the exit error reaches
+// errChan only after every message, including the error ResultMessage, is
+// queued in msgChan, so a consumer that drains msgChan after seeing the error
+// loses nothing. Python raises ProcessError after read_messages ends.
+func TestTransportSendsExitErrorAfterLastMessage(t *testing.T) {
+	ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+	defer cancel()
+
+	transport := New(newTransportMockCLIMode(t, mockModeBurstErrorResult), &shared.Options{}, "sdk-go")
+	t.Cleanup(func() { _ = transport.Close() })
+	connectTransportSafely(ctx, t, transport)
+
+	msgChan, errChan := transport.ReceiveMessages(ctx)
+	total := burstErrorResultAssistants + 1
+	consumed := total - cap(msgChan)
+	for i := 0; i < consumed; i++ {
+		select {
+		case <-msgChan:
+		case <-ctx.Done():
+			t.Fatalf("timed out reading message %d of %d", i+1, consumed)
+		}
+	}
+
+	select {
+	case err := <-errChan:
+		var processErr *shared.ProcessError
+		if !errors.As(err, &processErr) {
+			t.Fatalf("errChan error = %v (%T), want *ProcessError", err, err)
+		}
+	case <-ctx.Done():
+		t.Fatal("no exit error reported")
+	}
+	if got := len(msgChan); got != cap(msgChan) {
+		t.Fatalf("%d messages queued when the exit error arrived, want all %d", got, cap(msgChan))
+	}
+
+	var last shared.Message
+	for msg := range msgChan {
+		last = msg
+	}
+	if result, ok := last.(*shared.ResultMessage); !ok || !result.IsError {
+		t.Errorf("last message = %T, want the error *ResultMessage", last)
+	}
+}
+
 // TestTransportConnectFailureReapsProcess verifies that a failed Connect
 // returns and reaps the CLI even with no context deadline. Connect only
 // returns after teardown observed the sole cmd.Wait completing.

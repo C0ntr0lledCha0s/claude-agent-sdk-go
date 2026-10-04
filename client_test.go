@@ -443,7 +443,7 @@ func TestIteratorsTreatClosedErrChanAsNoError(t *testing.T) {
 		msgChan, errChan := newChannels()
 		streamErrChan := make(chan error)
 		close(streamErrChan)
-		drain(t, &clientIterator{msgChan: msgChan, errChan: errChan, streamErrChan: streamErrChan})
+		drain(t, &clientIterator{stream: newStreamReader(msgChan, errChan), streamErrChan: streamErrChan})
 	})
 	t.Run("query_iterator", func(t *testing.T) {
 		msgChan, errChan := newChannels()
@@ -451,10 +451,185 @@ func TestIteratorsTreatClosedErrChanAsNoError(t *testing.T) {
 			transport: newQueryMockTransport(),
 			ctx:       context.Background(),
 			started:   true,
-			msgChan:   msgChan,
-			errChan:   errChan,
+			stream:    newStreamReader(msgChan, errChan),
 		})
 	})
+}
+
+// streamErrorIterators builds each iterator type over hand-fed transport channels.
+func streamErrorIterators() map[string]func(msgChan <-chan Message, errChan <-chan error) MessageIterator {
+	return map[string]func(<-chan Message, <-chan error) MessageIterator{
+		"client_iterator": func(msgChan <-chan Message, errChan <-chan error) MessageIterator {
+			return &clientIterator{stream: newStreamReader(msgChan, errChan)}
+		},
+		"query_iterator": func(msgChan <-chan Message, errChan <-chan error) MessageIterator {
+			return &queryIterator{
+				transport: newQueryMockTransport(),
+				ctx:       context.Background(),
+				started:   true,
+				stream:    newStreamReader(msgChan, errChan),
+			}
+		},
+	}
+}
+
+// streamErrorTrials repeats each scenario on fresh channels. With a message and
+// an error both ready, select picks either at random, so the old code failed a
+// single trial about half the time and fails 50 in a row with probability
+// 1-2^-50.
+const streamErrorTrials = 50
+
+// TestIteratorsDeliverBufferedMessagesBeforeStreamError verifies Next hands out
+// every buffered message before the transport's terminal error, and does not
+// lose that error to a closed msgChan. The transport sends the error after
+// the last message and closes both channels, so Python's ProcessError always
+// follows the last message.
+func TestIteratorsDeliverBufferedMessagesBeforeStreamError(t *testing.T) {
+	exitErr := NewProcessError("Claude Code process exited unexpectedly", 1, "")
+
+	tests := []struct {
+		name        string
+		buffered    int
+		closeMsg    bool
+		wantMessage int
+	}{
+		{"error_ready_while_messages_buffered", 3, true, 3},
+		{"error_ready_with_msgchan_still_open", 3, false, 3},
+		{"msgchan_closed_with_error_in_closed_errchan", 0, true, 0},
+	}
+
+	for name, newIterator := range streamErrorIterators() {
+		for _, tt := range tests {
+			t.Run(name+"/"+tt.name, func(t *testing.T) {
+				ctx, cancel := setupClientTestContext(t, 10*time.Second)
+				defer cancel()
+
+				for trial := 0; trial < streamErrorTrials; trial++ {
+					msgChan := make(chan Message, tt.buffered)
+					for i := 0; i < tt.buffered; i++ {
+						msgChan <- &AssistantMessage{Model: fmt.Sprintf("m%d", i)}
+					}
+					errChan := make(chan error, 1)
+					errChan <- exitErr
+					close(errChan)
+					if tt.closeMsg {
+						close(msgChan)
+					}
+					iter := newIterator(msgChan, errChan)
+
+					for i := 0; i < tt.wantMessage; i++ {
+						msg, err := iter.Next(ctx)
+						if err != nil {
+							t.Fatalf("trial %d: Next() #%d = %v, want message m%d before the error", trial, i+1, err, i)
+						}
+						if got := msg.(*AssistantMessage).Model; got != fmt.Sprintf("m%d", i) {
+							t.Fatalf("trial %d: Next() #%d = %q, want m%d", trial, i+1, got, i)
+						}
+					}
+					if _, err := iter.Next(ctx); err != exitErr {
+						t.Fatalf("trial %d: Next() after %d messages error = %v, want the exit error", trial, tt.wantMessage, err)
+					}
+					if _, err := iter.Next(ctx); !errors.Is(err, ErrNoMoreMessages) {
+						t.Fatalf("trial %d: Next() after the exit error = %v, want ErrNoMoreMessages", trial, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestQueryIteratorDeliversResultBeforeExitError pins the symptom: a CLI that
+// exits non-zero right after an error ResultMessage must still yield that
+// ResultMessage to a consumer that was slow to read.
+func TestQueryIteratorDeliversResultBeforeExitError(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+	exitErr := NewProcessError("Claude Code returned an error result: boom", 1, "")
+
+	for trial := 0; trial < streamErrorTrials; trial++ {
+		msgChan := make(chan Message, 10)
+		for i := 0; i < 9; i++ {
+			msgChan <- &AssistantMessage{Model: "claude-3"}
+		}
+		msgChan <- &ResultMessage{IsError: true, Subtype: "error_during_execution"}
+		errChan := make(chan error, 1)
+		errChan <- exitErr
+		close(errChan)
+		close(msgChan)
+		iter := streamErrorIterators()["query_iterator"](msgChan, errChan)
+
+		sawResult := false
+		var end error
+		for end == nil {
+			msg, err := iter.Next(ctx)
+			if _, ok := msg.(*ResultMessage); ok {
+				sawResult = true
+			}
+			end = err
+		}
+		if !sawResult {
+			t.Fatalf("trial %d: ResultMessage lost to %v", trial, end)
+		}
+		if end != exitErr {
+			t.Fatalf("trial %d: ended with %v, want the exit error", trial, end)
+		}
+	}
+}
+
+// TestReceiveResponseExitErrorBelongsToNextCall verifies the exit error that
+// follows a turn's ResultMessage is not consumed by that turn: ReceiveResponse
+// ends at the ResultMessage (Python receive_response), and the error comes
+// out of the next call.
+func TestReceiveResponseExitErrorBelongsToNextCall(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+	exitErr := NewProcessError("Claude Code returned an error result: boom", 1, "")
+
+	for trial := 0; trial < streamErrorTrials; trial++ {
+		msgChan := make(chan Message, 3)
+		msgChan <- &AssistantMessage{Model: "claude-3"}
+		msgChan <- &AssistantMessage{Model: "claude-3"}
+		msgChan <- &ResultMessage{IsError: true, Subtype: "error_during_execution"}
+		close(msgChan)
+		errChan := make(chan error, 1)
+		errChan <- exitErr
+		close(errChan)
+		stream := newStreamReader(msgChan, errChan)
+
+		turn := &clientIterator{stream: stream}
+		for i := 0; i < 3; i++ {
+			if _, err := turn.Next(ctx); err != nil {
+				t.Fatalf("trial %d: turn Next() #%d = %v, want the turn's messages", trial, i+1, err)
+			}
+		}
+		if _, err := turn.Next(ctx); !errors.Is(err, ErrNoMoreMessages) {
+			t.Fatalf("trial %d: turn Next() after the ResultMessage = %v, want ErrNoMoreMessages", trial, err)
+		}
+
+		next := &clientIterator{stream: stream}
+		if _, err := next.Next(ctx); err != exitErr {
+			t.Fatalf("trial %d: next call = %v, want the exit error", trial, err)
+		}
+	}
+}
+
+// An iterator blocked in next while another sharing the reader sets the error
+// aside must still return that error when msgChan closes under it.
+func TestStreamReaderEndOfStreamReturnsPendingError(t *testing.T) {
+	exitErr := NewProcessError("Claude Code process exited unexpectedly", 1, "")
+	msgChan := make(chan Message)
+	close(msgChan)
+	errChan := make(chan error)
+	close(errChan)
+	stream := newStreamReader(msgChan, errChan)
+
+	stream.setPending(exitErr)
+	if err := stream.endOfStream(); err != exitErr {
+		t.Fatalf("endOfStream() = %v, want the pending exit error", err)
+	}
+	if err := stream.endOfStream(); !errors.Is(err, ErrNoMoreMessages) {
+		t.Fatalf("endOfStream() after the error was taken = %v, want ErrNoMoreMessages", err)
+	}
 }
 
 // TestClientReceiveMessages tests message reception through client channels
@@ -2388,9 +2563,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  true, // Already closed
+					stream: newStreamReader(msgChan, errChan),
+					closed: true, // Already closed
 				}
 				ctx, cancel := setupClientTestContext(t, 5*time.Second)
 				return iter, ctx, cancel
@@ -2412,9 +2586,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  false,
+					stream: newStreamReader(msgChan, errChan),
+					closed: false,
 				}
 				ctx, cancel := setupClientTestContext(t, 50*time.Millisecond)
 				return iter, ctx, cancel
@@ -2436,9 +2609,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error, 1)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  false,
+					stream: newStreamReader(msgChan, errChan),
+					closed: false,
 				}
 
 				// Send error to error channel
@@ -2468,9 +2640,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  false,
+					stream: newStreamReader(msgChan, errChan),
+					closed: false,
 				}
 
 				// Close the message channel
@@ -3206,7 +3377,7 @@ func TestClientIteratorStopsAfterResultMessage(t *testing.T) {
 	msgChan <- &AssistantMessage{Content: []ContentBlock{&TextBlock{Text: "first"}}}
 	msgChan <- &ResultMessage{SessionID: "s1"}
 	msgChan <- &AssistantMessage{Content: []ContentBlock{&TextBlock{Text: "next turn"}}}
-	iter := &clientIterator{msgChan: msgChan, errChan: make(chan error)}
+	iter := &clientIterator{stream: newStreamReader(msgChan, make(chan error))}
 
 	if msg, err := iter.Next(ctx); err != nil {
 		t.Fatalf("first Next: %v", err)

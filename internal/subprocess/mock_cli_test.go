@@ -64,6 +64,7 @@ const (
 	mockModeTwoPermissionReqs   = "two_permission_requests"
 	mockModeExitNonZero         = "exit_nonzero"
 	mockModeErrorResultExit     = "error_result_exit"
+	mockModeBurstErrorResult    = "burst_error_result_exit"
 	mockModeIgnoreSIGTERM       = "ignore_sigterm"
 	mockModeSlowExitAfterEOF    = "slow_exit_after_eof"
 	mockModeStopReading         = "stop_reading"
@@ -281,6 +282,12 @@ func runMockBurstExit() {
 	_ = out.Flush()
 }
 
+// burstErrorResultAssistants is the number of assistant messages
+// burst_error_result_exit writes before its error result. Together with the
+// result it exceeds msgChan's capacity, so the transport blocks on a slow
+// reader while the CLI has already exited.
+const burstErrorResultAssistants = 15
+
 const mockErrorResult = `{"type":"result","subtype":"error_during_execution","duration_ms":1,"duration_api_ms":1,"is_error":true,"num_turns":1,"session_id":"s","total_cost_usd":0}`
 
 // runMockEarlyErrorResult writes an error result before and after answering
@@ -330,7 +337,7 @@ func runMockTwoPermissionRequests() {
 // slowExitDelay is how long slow_exit_after_eof keeps running after stdin EOF.
 const slowExitDelay = 1500 * time.Millisecond
 
-// runShutdownMock runs the shutdown, exit and server_info modes and exits 2
+// runShutdownMock runs the modes runMockCLI does not handle itself and exits 2
 // for an unknown mode. Split from runMockCLI to keep its complexity flat.
 func runShutdownMock(mode string) {
 	switch mode {
@@ -346,6 +353,8 @@ func runShutdownMock(mode string) {
 		runMockIgnoreSIGTERM()
 	case mockModeSlowExitAfterEOF:
 		runMockSlowExitAfterEOF()
+	case mockModeBurstErrorResult:
+		runMockBurstErrorResult()
 	case mockModeStopReading:
 		answerInitialize()
 		// Never read stdin again, so the SDK's stdin writes block once the pipe is full.
@@ -420,6 +429,17 @@ func runMockServerInfo() {
 		}
 	}
 	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// runMockBurstErrorResult answers initialize, writes the assistant messages
+// and an error result without waiting for the reader, then exits 1.
+func runMockBurstErrorResult() {
+	answerInitialize()
+	for i := 0; i < burstErrorResultAssistants; i++ {
+		fmt.Println(burstExitAssistantMsg)
+	}
+	fmt.Println(mockErrorResult)
+	os.Exit(1)
 }
 
 // runMockIgnoreSIGTERM logs and ignores SIGTERM, so only SIGKILL ends it.
