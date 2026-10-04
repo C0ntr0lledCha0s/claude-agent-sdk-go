@@ -34,14 +34,13 @@ var DiscoveryPaths = []string{
 // FindCLI searches for the Claude CLI binary in standard locations.
 func FindCLI() (string, error) {
 	// 1. Check PATH first - most common case
-	if path, err := exec.LookPath("claude"); err == nil {
+	path, lastResort := findOnPath(runtime.GOOS, exec.LookPath)
+	if path != "" {
 		return path, nil
 	}
 
 	// 2. Check platform-specific common locations
-	locations := getCommonCLILocations()
-
-	for _, location := range locations {
+	for _, location := range getCommonCLILocations() {
 		if info, err := os.Stat(location); err == nil && !info.IsDir() {
 			// Verify it's executable (Unix-like systems)
 			if runtime.GOOS != windowsOS {
@@ -51,6 +50,21 @@ func FindCLI() (string, error) {
 			}
 			return location, nil
 		}
+	}
+
+	// A shim found on PATH goes to Connect, which explains why it refuses to run it.
+	if lastResort != "" {
+		return lastResort, nil
+	}
+
+	// npm's Windows install is a claude.cmd shim, which Connect refuses, so do not recommend it.
+	if runtime.GOOS == windowsOS {
+		return "", shared.NewCLINotFoundError("",
+			"Claude Code not found. Install the native claude.exe with (PowerShell):\n"+
+				"  irm https://claude.ai/install.ps1 | iex\n\n"+
+				"Or specify the path to a claude.exe with WithCLIPath.\n\n"+
+				"(npm install -g @anthropic-ai/claude-code produces a claude.cmd shim, "+
+				"which this SDK refuses to run on Windows.)")
 	}
 
 	// 3. Check Node.js dependency
@@ -71,6 +85,61 @@ func FindCLI() (string, error) {
 			"Or specify the path when creating client")
 }
 
+// findOnPath returns the CLI to use from PATH, or on Windows a non-native hit to keep as a last resort.
+// A shim in an early PATH directory can shadow a native claude.exe in a later one (Python _find_cli).
+func findOnPath(goos string, lookPath func(string) (string, error)) (use, lastResort string) {
+	hit, err := lookPath("claude")
+	if err != nil {
+		return "", ""
+	}
+	if goos != windowsOS || isWindowsNativeExe(hit) {
+		return hit, ""
+	}
+	// PATHEXT can turn the claude.exe probe into "claude.exe.cmd", so check it too.
+	if exe, err := lookPath("claude.exe"); err == nil && isWindowsNativeExe(exe) {
+		return exe, ""
+	}
+	return "", hit
+}
+
+// isWindowsNativeExe reports whether the final path component names a .exe or .com image.
+// It only picks a discovery result; RejectWindowsBatchCLI is the security check.
+func isWindowsNativeExe(path string) bool {
+	components := strings.Split(strings.ReplaceAll(path, `\`, "/"), "/")
+	name := strings.ToLower(strings.TrimRight(components[len(components)-1], ". "))
+	return strings.HasSuffix(name, ".exe") || strings.HasSuffix(name, ".com")
+}
+
+// isWindowsBatchPath reports whether any path component names a .bat or .cmd file.
+// Plain string logic (no filepath) so it gives the same result on every OS. Every component is
+// checked because Win32 path normalization ("..", trailing dots, stream specs) can make any of
+// them the file that runs; no real claude.exe lives under a directory named like a batch file.
+func isWindowsBatchPath(path string) bool {
+	for _, component := range strings.Split(strings.ReplaceAll(path, `\`, "/"), "/") {
+		for _, segment := range strings.Split(component, ":") {
+			name := strings.ToLower(strings.TrimRight(segment, ". "))
+			if strings.HasSuffix(name, ".bat") || strings.HasSuffix(name, ".cmd") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// RejectWindowsBatchCLI refuses a .bat or .cmd CLI path on Windows (Python #1127).
+// Windows runs a batch file through cmd.exe, which re-parses the arguments, and no
+// reliable cmd.exe escaping exists (CVE-2024-27980, "BatBadBut").
+func RejectWindowsBatchCLI(goos, path string) error {
+	if goos != windowsOS || !isWindowsBatchPath(path) {
+		return nil
+	}
+	return shared.NewConnectionError(fmt.Sprintf(
+		"refusing to execute batch script %s: Windows runs .bat/.cmd files via cmd.exe, "+
+			"which can execute commands injected through CLI arguments, and no reliable escaping "+
+			"for cmd.exe exists. Use a native claude executable instead: install Claude Code "+
+			"natively (irm https://claude.ai/install.ps1 | iex), or point WithCLIPath at a claude.exe", path), nil)
+}
+
 // getCommonCLILocations returns platform-specific CLI search locations
 func getCommonCLILocations() []string {
 	homeDir, err := os.UserHomeDir()
@@ -78,64 +147,35 @@ func getCommonCLILocations() []string {
 		// Fallback to current directory if home directory can't be determined
 		homeDir = "."
 	}
+	return commonCLILocations(runtime.GOOS, homeDir)
+}
 
-	var locations []string
-
-	switch runtime.GOOS {
-	case windowsOS:
-		locations = []string{
-			filepath.Join(homeDir, "AppData", "Roaming", "npm", "claude.cmd"),
-			filepath.Join("C:", "Program Files", "nodejs", "claude.cmd"),
-			filepath.Join(homeDir, ".npm-global", "claude.cmd"),
-			filepath.Join(homeDir, "node_modules", ".bin", "claude.cmd"),
-		}
-	default: // Unix-like systems
-		locations = []string{
-			filepath.Join(homeDir, ".npm-global", "bin", "claude"),
-			"/usr/local/bin/claude",
-			filepath.Join(homeDir, ".local", "bin", "claude"),
-			filepath.Join(homeDir, "node_modules", ".bin", "claude"),
-			filepath.Join(homeDir, ".yarn", "bin", "claude"),
-			"/opt/homebrew/bin/claude",       // macOS Homebrew ARM
-			"/usr/local/homebrew/bin/claude", // macOS Homebrew Intel
-		}
+// commonCLILocations returns the CLI search locations for goos.
+func commonCLILocations(goos, homeDir string) []string {
+	if goos == windowsOS {
+		// Only the native installer's claude.exe: npm's claude.cmd shim is refused at Connect.
+		return []string{filepath.Join(homeDir, ".local", "bin", "claude.exe")}
 	}
-
-	return locations
+	return []string{
+		filepath.Join(homeDir, ".npm-global", "bin", "claude"),
+		"/usr/local/bin/claude",
+		filepath.Join(homeDir, ".local", "bin", "claude"),
+		filepath.Join(homeDir, "node_modules", ".bin", "claude"),
+		filepath.Join(homeDir, ".yarn", "bin", "claude"),
+		"/opt/homebrew/bin/claude",       // macOS Homebrew ARM
+		"/usr/local/homebrew/bin/claude", // macOS Homebrew Intel
+	}
 }
 
 // BuildCommand constructs the CLI command with all necessary flags.
-func BuildCommand(cliPath string, options *shared.Options, closeStdin bool) []string {
+// Always uses streaming mode (--input-format stream-json); prompts are
+// written to stdin after the initialize handshake instead of via --print.
+func BuildCommand(cliPath string, options *shared.Options) []string {
 	cmd := []string{cliPath}
 
-	// Base arguments - always include these
 	cmd = append(cmd, "--output-format", "stream-json", "--verbose")
+	cmd = append(cmd, "--input-format", "stream-json")
 
-	// Input mode configuration
-	if closeStdin {
-		// One-shot mode (Query function)
-		cmd = append(cmd, "--print")
-	} else {
-		// Streaming mode (Client interface)
-		cmd = append(cmd, "--input-format", "stream-json")
-	}
-
-	// Add all configuration options as CLI flags
-	if options != nil {
-		cmd = addOptionsToCommand(cmd, options)
-	}
-
-	return cmd
-}
-
-// BuildCommandWithPrompt constructs the CLI command for one-shot queries with prompt as argument.
-func BuildCommandWithPrompt(cliPath string, options *shared.Options, prompt string) []string {
-	cmd := []string{cliPath}
-
-	// Base arguments - always include these
-	cmd = append(cmd, "--output-format", "stream-json", "--verbose", "--print", prompt)
-
-	// Add all configuration options as CLI flags
 	if options != nil {
 		cmd = addOptionsToCommand(cmd, options)
 	}
@@ -145,12 +185,19 @@ func BuildCommandWithPrompt(cliPath string, options *shared.Options, prompt stri
 
 // addOptionsToCommand adds all Options fields as CLI flags
 func addOptionsToCommand(cmd []string, options *shared.Options) []string {
+	// Apply Skills option by transforming AllowedTools and SettingSources before
+	// any flags are emitted. Matches the Python SDK's _apply_skills_defaults.
+	if options.Skills != nil {
+		copied := *options
+		copied.AllowedTools, copied.SettingSources = applySkillsDefaults(options)
+		options = &copied
+	}
+
 	cmd = addToolControlFlags(cmd, options)
 	cmd = addToolsFlag(cmd, options)
 	cmd = addModelAndPromptFlags(cmd, options)
 	cmd = addPermissionFlags(cmd, options)
 	cmd = addSessionFlags(cmd, options)
-	cmd = addAgentFlags(cmd, options)
 	cmd = addFileSystemFlags(cmd, options)
 	cmd = addMCPFlags(cmd, options)
 	cmd = addPluginsFlag(cmd, options)
@@ -204,14 +251,24 @@ func addModelAndPromptFlags(cmd []string, options *shared.Options) []string {
 	if options.FallbackModel != nil {
 		cmd = append(cmd, "--fallback-model", *options.FallbackModel)
 	}
+	if options.Effort != nil {
+		cmd = append(cmd, "--effort", *options.Effort)
+	}
 	if options.MaxBudgetUSD != nil {
 		cmd = append(cmd, "--max-budget-usd", fmt.Sprintf("%.2f", *options.MaxBudgetUSD))
 	}
-	// NOTE: --max-thinking-tokens not supported by current CLI version
-	// if options.MaxThinkingTokens > 0 {
-	//	cmd = append(cmd, "--max-thinking-tokens", fmt.Sprintf("%d", options.MaxThinkingTokens))
-	// }
+	cmd = addThinkingFlags(cmd, options)
 	// NOTE: User and MaxBufferSize are internal SDK options without CLI flag mappings
+	return cmd
+}
+
+func addThinkingFlags(cmd []string, options *shared.Options) []string {
+	if args := shared.ThinkingArgs(options.Thinking); args != nil {
+		return append(cmd, args...)
+	}
+	if options.MaxThinkingTokens > 0 {
+		cmd = append(cmd, "--max-thinking-tokens", strconv.Itoa(options.MaxThinkingTokens))
+	}
 	return cmd
 }
 
@@ -230,7 +287,8 @@ func addSessionFlags(cmd []string, options *shared.Options) []string {
 		cmd = append(cmd, "--continue")
 	}
 	if options.Resume != nil {
-		cmd = append(cmd, "--resume", *options.Resume)
+		// One token: the CLI's --resume takes an optional value, so a dash-leading value would parse as a flag.
+		cmd = append(cmd, "--resume="+*options.Resume)
 	}
 	if options.MaxTurns > 0 {
 		cmd = append(cmd, "--max-turns", fmt.Sprintf("%d", options.MaxTurns))
@@ -243,51 +301,27 @@ func addSessionFlags(cmd []string, options *shared.Options) []string {
 	if options.ForkSession {
 		cmd = append(cmd, "--fork-session")
 	}
-	// Always pass --setting-sources (Python SDK parity)
-	// Empty slice results in empty string value
-	sourcesValue := ""
-	if len(options.SettingSources) > 0 {
+	// Equals form keeps a dash-leading value bound to its flag (Python #1198).
+	if options.ResumeSessionAt != nil && *options.ResumeSessionAt != "" {
+		cmd = append(cmd, "--resume-session-at="+*options.ResumeSessionAt)
+	}
+	// Nil check, not empty: the CLI must reject an empty value so the guard is never silently off.
+	if options.ResumeDropsTurn != nil {
+		cmd = append(cmd, "--resume-drops-turn="+*options.ResumeDropsTurn)
+	}
+	// Nil keeps the CLI defaults; an empty list loads no settings (Python #822).
+	// One token keeps the empty value bound to the flag.
+	if options.SettingSources != nil {
 		strs := make([]string, len(options.SettingSources))
 		for i, s := range options.SettingSources {
 			strs[i] = string(s)
 		}
-		sourcesValue = strings.Join(strs, ",")
+		cmd = append(cmd, "--setting-sources="+strings.Join(strs, ","))
 	}
-	cmd = append(cmd, "--setting-sources", sourcesValue)
 	if options.IncludePartialMessages {
 		cmd = append(cmd, "--include-partial-messages")
 	}
 	return cmd
-}
-
-func addAgentFlags(cmd []string, options *shared.Options) []string {
-	if len(options.Agents) == 0 {
-		return cmd
-	}
-
-	// Convert to map[string]map[string]any, filtering nil/empty fields
-	// This matches Python SDK behavior of omitting None values
-	agentsMap := make(map[string]map[string]any)
-	for name, agent := range options.Agents {
-		agentMap := map[string]any{
-			"description": agent.Description,
-			"prompt":      agent.Prompt,
-		}
-		if len(agent.Tools) > 0 {
-			agentMap["tools"] = agent.Tools
-		}
-		if agent.Model != "" {
-			agentMap["model"] = string(agent.Model)
-		}
-		agentsMap[name] = agentMap
-	}
-
-	data, err := json.Marshal(agentsMap)
-	if err != nil {
-		return cmd // Skip on serialization error
-	}
-
-	return append(cmd, "--agents", string(data))
 }
 
 func addFileSystemFlags(cmd []string, options *shared.Options) []string {
@@ -374,10 +408,14 @@ func addOutputFormatFlags(cmd []string, options *shared.Options) []string {
 
 func addExtraFlags(cmd []string, options *shared.Options) []string {
 	for flag, value := range options.ExtraArgs {
-		if value == nil {
+		switch {
+		case value == nil:
 			// Boolean flag
 			cmd = append(cmd, "--"+flag)
-		} else {
+		case strings.HasPrefix(*value, "-"):
+			// A separate dash-leading value would parse as its own flag (Python #1127).
+			cmd = append(cmd, "--"+flag+"="+*value)
+		default:
 			// Flag with value
 			cmd = append(cmd, "--"+flag, *value)
 		}
@@ -463,6 +501,50 @@ func CheckCLIVersion(ctx context.Context, cliPath string) (warning string) {
 	}
 
 	return ""
+}
+
+// applySkillsDefaults computes the effective AllowedTools and SettingSources for
+// the Skills option without mutating the input. When Skills is "all", appends the
+// bare "Skill" tool; when it is a []string, appends "Skill(name)" for each entry.
+// When Skills is non-nil and SettingSources is unset, defaults SettingSources to
+// [user, project] so the CLI discovers installed Skills. Mirrors the Python SDK's
+// _apply_skills_defaults in subprocess_cli.py.
+func applySkillsDefaults(options *shared.Options) ([]string, []shared.SettingSource) {
+	allowedTools := append([]string(nil), options.AllowedTools...)
+	settingSources := options.SettingSources
+
+	switch s := options.Skills.(type) {
+	case nil:
+		return allowedTools, settingSources
+	case string:
+		if s == shared.SkillsAll && !containsString(allowedTools, "Skill") {
+			allowedTools = append(allowedTools, "Skill")
+		}
+	case []string:
+		for _, name := range s {
+			pattern := fmt.Sprintf("Skill(%s)", name)
+			if !containsString(allowedTools, pattern) {
+				allowedTools = append(allowedTools, pattern)
+			}
+		}
+	}
+
+	if settingSources == nil {
+		settingSources = []shared.SettingSource{
+			shared.SettingSourceUser,
+			shared.SettingSourceProject,
+		}
+	}
+	return allowedTools, settingSources
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // compareVersionParts compares two X.Y.Z versions.

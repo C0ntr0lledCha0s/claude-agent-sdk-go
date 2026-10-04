@@ -1,6 +1,8 @@
 package shared
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -13,7 +15,8 @@ func TestOptionsDefaults(t *testing.T) {
 		field    interface{}
 		expected interface{}
 	}{
-		{"MaxThinkingTokens", options.MaxThinkingTokens, 8000},
+		{"MaxThinkingTokens", options.MaxThinkingTokens, 0},
+		{"Thinking_nil", options.Thinking == nil, true},
 		{"ContinueConversation", options.ContinueConversation, false},
 		{"MaxTurns", options.MaxTurns, 0},
 		{"AllowedTools_initialized", options.AllowedTools == nil, false},
@@ -31,8 +34,8 @@ func TestOptionsDefaults(t *testing.T) {
 		{"ExtraEnv_initialized", options.ExtraEnv == nil, false},
 		{"ExtraEnv_empty", len(options.ExtraEnv), 0},
 		{"ForkSession", options.ForkSession, false},
-		{"SettingSources_initialized", options.SettingSources == nil, false},
-		{"SettingSources_empty", len(options.SettingSources), 0},
+		// nil keeps the CLI default sources (Python setting_sources=None).
+		{"SettingSources_nil", options.SettingSources == nil, true},
 	}
 
 	for _, test := range tests {
@@ -163,6 +166,112 @@ func TestMcpServerTypes(t *testing.T) {
 			assertMcpServerType(t, test.config, test.expectedType)
 		})
 	}
+}
+
+// TestMcpServerConfigAlwaysLoad verifies that AlwaysLoad is wired through all
+// four MCP server config structs and round-trips through JSON correctly.
+// A false (default) value must be omitted from the marshaled output thanks to
+// the omitempty tag, so the CLI sees only servers that have explicitly opted in.
+func TestMcpServerConfigAlwaysLoad(t *testing.T) {
+	t.Run("defaults_to_false", func(t *testing.T) {
+		stdio := &McpStdioServerConfig{Type: McpServerTypeStdio, Command: "node"}
+		sse := &McpSSEServerConfig{Type: McpServerTypeSSE, URL: "https://example.com/sse"}
+		http := &McpHTTPServerConfig{Type: McpServerTypeHTTP, URL: "https://example.com/http"}
+		sdk := &McpSdkServerConfig{Type: McpServerTypeSdk, Name: "test"}
+		if stdio.AlwaysLoad || sse.AlwaysLoad || http.AlwaysLoad || sdk.AlwaysLoad {
+			t.Error("AlwaysLoad should default to false on all MCP server config types")
+		}
+	})
+
+	tests := []struct {
+		name   string
+		config McpServerConfig
+	}{
+		{
+			name: "stdio",
+			config: &McpStdioServerConfig{
+				Type:       McpServerTypeStdio,
+				Command:    "node",
+				Args:       []string{"server.js"},
+				AlwaysLoad: true,
+			},
+		},
+		{
+			name: "sse",
+			config: &McpSSEServerConfig{
+				Type:       McpServerTypeSSE,
+				URL:        "https://example.com/sse",
+				AlwaysLoad: true,
+			},
+		},
+		{
+			name: "http",
+			config: &McpHTTPServerConfig{
+				Type:       McpServerTypeHTTP,
+				URL:        "https://example.com/http",
+				AlwaysLoad: true,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+"_marshals_alwaysLoad_when_true", func(t *testing.T) {
+			data, err := json.Marshal(test.config)
+			if err != nil {
+				t.Fatalf("Marshal failed: %v", err)
+			}
+			if !strings.Contains(string(data), `"alwaysLoad":true`) {
+				t.Errorf("Expected JSON to contain alwaysLoad:true, got %s", data)
+			}
+		})
+	}
+
+	for _, test := range tests {
+		t.Run(test.name+"_omits_alwaysLoad_when_false", func(t *testing.T) {
+			// Construct a copy with AlwaysLoad cleared.
+			var data []byte
+			var err error
+			switch c := test.config.(type) {
+			case *McpStdioServerConfig:
+				dup := *c
+				dup.AlwaysLoad = false
+				data, err = json.Marshal(&dup)
+			case *McpSSEServerConfig:
+				dup := *c
+				dup.AlwaysLoad = false
+				data, err = json.Marshal(&dup)
+			case *McpHTTPServerConfig:
+				dup := *c
+				dup.AlwaysLoad = false
+				data, err = json.Marshal(&dup)
+			}
+			if err != nil {
+				t.Fatalf("Marshal failed: %v", err)
+			}
+			if strings.Contains(string(data), "alwaysLoad") {
+				t.Errorf("Expected alwaysLoad to be omitted when false, got %s", data)
+			}
+		})
+	}
+
+	t.Run("stdio_round_trip", func(t *testing.T) {
+		original := &McpStdioServerConfig{
+			Type:       McpServerTypeStdio,
+			Command:    "node",
+			AlwaysLoad: true,
+		}
+		data, err := json.Marshal(original)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+		var decoded McpStdioServerConfig
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("Unmarshal failed: %v", err)
+		}
+		if !decoded.AlwaysLoad {
+			t.Error("AlwaysLoad lost in round-trip")
+		}
+	})
 }
 
 // TestPermissionModeConstants tests permission mode constant values

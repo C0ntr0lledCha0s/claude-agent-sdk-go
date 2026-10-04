@@ -18,8 +18,6 @@ import (
 //go:embed testdata/cli_responses/*
 var integrationFixtures embed.FS
 
-// Helper Functions - following client_test.go patterns
-
 // setupIntegrationContext creates a context for integration tests
 func setupIntegrationContext(t *testing.T, timeout time.Duration) (context.Context, context.CancelFunc) {
 	t.Helper()
@@ -46,7 +44,6 @@ func disconnectIntegrationClientSafely(t *testing.T, client claudecode.Client) {
 func verifyIntegrationResourceCleanup(t *testing.T, transport *integrationMockTransport) {
 	t.Helper()
 
-	// Ensure transport is closed before verification - following client_test.go patterns
 	if transport != nil {
 		transport.Close()
 	}
@@ -206,8 +203,6 @@ func loadIntegrationFixture(t *testing.T, name string) []claudecode.Message {
 
 	return messages
 }
-
-// Mock Transport Factory Functions - following client_test.go patterns
 
 type IntegrationMockTransportOption func(*integrationMockTransport)
 
@@ -519,7 +514,6 @@ func (r *integrationResourceTracker) releaseConnection() {
 	}
 }
 
-// Resource cleanup verification helpers following client_test.go patterns
 func setupResourceCleanupTest(t *testing.T) (*integrationMockTransport, int) {
 	t.Helper()
 

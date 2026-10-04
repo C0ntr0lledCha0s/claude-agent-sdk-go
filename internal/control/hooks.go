@@ -84,6 +84,7 @@ func (p *Protocol) parseHookInput(event HookEvent, inputData map[string]any) any
 			HookEventName: "PreToolUse",
 			ToolName:      getString(inputData, "tool_name"),
 			ToolInput:     getMap(inputData, "tool_input"),
+			ToolUseID:     getString(inputData, "tool_use_id"),
 		}
 	case HookEventPostToolUse:
 		return &PostToolUseHookInput{
@@ -92,6 +93,17 @@ func (p *Protocol) parseHookInput(event HookEvent, inputData map[string]any) any
 			ToolName:      getString(inputData, "tool_name"),
 			ToolInput:     getMap(inputData, "tool_input"),
 			ToolResponse:  inputData["tool_response"],
+			ToolUseID:     getString(inputData, "tool_use_id"),
+		}
+	case HookEventPostToolUseFailure:
+		return &PostToolUseFailureHookInput{
+			BaseHookInput: base,
+			HookEventName: "PostToolUseFailure",
+			ToolName:      getString(inputData, "tool_name"),
+			ToolInput:     getMap(inputData, "tool_input"),
+			ToolUseID:     getString(inputData, "tool_use_id"),
+			Error:         getString(inputData, "error"),
+			IsInterrupt:   getBoolPtr(inputData, "is_interrupt"),
 		}
 	case HookEventUserPromptSubmit:
 		return &UserPromptSubmitHookInput{
@@ -107,9 +119,12 @@ func (p *Protocol) parseHookInput(event HookEvent, inputData map[string]any) any
 		}
 	case HookEventSubagentStop:
 		return &SubagentStopHookInput{
-			BaseHookInput:  base,
-			HookEventName:  "SubagentStop",
-			StopHookActive: getBool(inputData, "stop_hook_active"),
+			BaseHookInput:       base,
+			HookEventName:       "SubagentStop",
+			StopHookActive:      getBool(inputData, "stop_hook_active"),
+			AgentID:             getString(inputData, "agent_id"),
+			AgentTranscriptPath: getString(inputData, "agent_transcript_path"),
+			AgentType:           getString(inputData, "agent_type"),
 		}
 	case HookEventPreCompact:
 		return &PreCompactHookInput{
@@ -117,6 +132,29 @@ func (p *Protocol) parseHookInput(event HookEvent, inputData map[string]any) any
 			HookEventName:      "PreCompact",
 			Trigger:            getString(inputData, "trigger"),
 			CustomInstructions: getStringPtr(inputData, "custom_instructions"),
+		}
+	case HookEventNotification:
+		return &NotificationHookInput{
+			BaseHookInput:    base,
+			HookEventName:    "Notification",
+			Message:          getString(inputData, "message"),
+			Title:            getStringPtr(inputData, "title"),
+			NotificationType: getString(inputData, "notification_type"),
+		}
+	case HookEventSubagentStart:
+		return &SubagentStartHookInput{
+			BaseHookInput: base,
+			HookEventName: "SubagentStart",
+			AgentID:       getString(inputData, "agent_id"),
+			AgentType:     getString(inputData, "agent_type"),
+		}
+	case HookEventPermissionRequest:
+		return &PermissionRequestHookInput{
+			BaseHookInput:         base,
+			HookEventName:         "PermissionRequest",
+			ToolName:              getString(inputData, "tool_name"),
+			ToolInput:             getMap(inputData, "tool_input"),
+			PermissionSuggestions: getAnySlice(inputData, "permission_suggestions"),
 		}
 	default:
 		// Forward compatibility - return raw input for unknown events
@@ -165,7 +203,7 @@ func (p *Protocol) sendHookResponse(ctx context.Context, requestID string, resul
 		return fmt.Errorf("failed to marshal hook response: %w", err)
 	}
 
-	return p.transport.Write(ctx, append(data, '\n'))
+	return p.writeControlResponse(ctx, data)
 }
 
 // generateHookRegistrations creates hook registrations for initialization.
@@ -208,7 +246,9 @@ func (p *Protocol) generateHookRegistrations() []HookRegistration {
 
 // buildHooksConfig creates the hooks config for the initialize request.
 // Format: {"PreToolUse": [{"matcher": "Bash", "hookCallbackIds": ["hook_0"]}], ...}
-// This matches the Python SDK's format exactly for CLI compatibility.
+//
+// Returns nil when no matchers register any callbacks, so the initialize
+// request emits `"hooks":null` rather than `"hooks":{}` for the empty case.
 func (p *Protocol) buildHooksConfig() map[string][]HookMatcherConfig {
 	if p.hooks == nil {
 		return nil
@@ -251,6 +291,9 @@ func (p *Protocol) buildHooksConfig() map[string][]HookMatcherConfig {
 	}
 	p.hookCallbacksMu.Unlock()
 
+	if len(config) == 0 {
+		return nil
+	}
 	return config
 }
 
@@ -277,9 +320,25 @@ func getBool(m map[string]any, key string) bool {
 	return false
 }
 
+func getBoolPtr(m map[string]any, key string) *bool {
+	if v, ok := m[key].(bool); ok {
+		return &v
+	}
+	return nil
+}
+
 func getMap(m map[string]any, key string) map[string]any {
 	if v, ok := m[key].(map[string]any); ok {
 		return v
 	}
 	return make(map[string]any)
+}
+
+// getAnySlice returns m[key] as a []any if present, or nil if absent or wrong type.
+// Returns nil (not empty slice) to preserve Python's NotRequired absent-state semantics.
+func getAnySlice(m map[string]any, key string) []any {
+	if v, ok := m[key].([]any); ok {
+		return v
+	}
+	return nil
 }

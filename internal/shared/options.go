@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 )
 
 const (
-	// DefaultMaxThinkingTokens is the default maximum number of thinking tokens.
+	// DefaultMaxThinkingTokens was the default for MaxThinkingTokens.
+	//
+	// Deprecated: NewOptions no longer applies a default, so the CLI chooses.
 	DefaultMaxThinkingTokens = 8000
 )
 
@@ -43,6 +46,10 @@ type ToolsPreset struct {
 	Type   string `json:"type"`   // Always "preset"
 	Preset string `json:"preset"` // e.g., "claude_code"
 }
+
+// SkillsAll is the sentinel string value for Options.Skills that enables every
+// discovered Skill. Mirrors the Python SDK's skills="all" value.
+const SkillsAll = "all"
 
 // SettingSource represents a settings source location.
 type SettingSource string
@@ -113,7 +120,7 @@ type SdkPluginConfig struct {
 }
 
 // OutputFormat specifies the format for structured output.
-// Matches the Messages API structure: {"type": "json_schema", "schema": {...}}
+// Wire format: {"type": "json_schema", "schema": {...}}
 type OutputFormat struct {
 	Type   string         `json:"type"`   // Always "json_schema"
 	Schema map[string]any `json:"schema"` // JSON Schema definition
@@ -132,6 +139,94 @@ const (
 	// AgentModelInherit specifies the agent should inherit the parent's model.
 	AgentModelInherit AgentModel = "inherit"
 )
+
+// EffortLevel controls how many tokens Claude spends per response, trading off
+// thoroughness against token efficiency. Maps to the CLI's --effort flag.
+type EffortLevel string
+
+const (
+	// EffortLow minimizes token usage.
+	EffortLow EffortLevel = "low"
+	// EffortMedium balances token usage and thoroughness.
+	EffortMedium EffortLevel = "medium"
+	// EffortHigh favors thoroughness over token efficiency.
+	EffortHigh EffortLevel = "high"
+	// EffortXHigh requests the highest effort (model-dependent).
+	EffortXHigh EffortLevel = "xhigh"
+	// EffortMax requests maximum effort (model-dependent, session-only).
+	EffortMax EffortLevel = "max"
+)
+
+// ThinkingDisplay controls how the CLI returns thinking content.
+type ThinkingDisplay string
+
+const (
+	// ThinkingDisplaySummarized returns a summary of the thinking.
+	ThinkingDisplaySummarized ThinkingDisplay = "summarized"
+	// ThinkingDisplayOmitted omits the thinking content.
+	ThinkingDisplayOmitted ThinkingDisplay = "omitted"
+)
+
+// ThinkingConfig controls extended thinking. The implementations are
+// ThinkingConfigAdaptive, ThinkingConfigEnabled and ThinkingConfigDisabled.
+type ThinkingConfig interface {
+	thinkingArgs() []string
+}
+
+// ThinkingConfigAdaptive lets the model decide how much to think.
+type ThinkingConfigAdaptive struct {
+	Display ThinkingDisplay
+}
+
+// ThinkingConfigEnabled sets a fixed token budget for thinking.
+type ThinkingConfigEnabled struct {
+	BudgetTokens int
+	Display      ThinkingDisplay
+}
+
+// ThinkingConfigDisabled turns thinking off.
+type ThinkingConfigDisabled struct{}
+
+func (c ThinkingConfigAdaptive) thinkingArgs() []string {
+	return appendThinkingDisplay([]string{"--thinking", "adaptive"}, c.Display)
+}
+
+func (c ThinkingConfigEnabled) thinkingArgs() []string {
+	return appendThinkingDisplay([]string{"--max-thinking-tokens", strconv.Itoa(c.BudgetTokens)}, c.Display)
+}
+
+func (ThinkingConfigDisabled) thinkingArgs() []string {
+	return []string{"--thinking", "disabled"}
+}
+
+func appendThinkingDisplay(args []string, display ThinkingDisplay) []string {
+	if display == "" {
+		return args
+	}
+	return append(args, "--thinking-display", string(display))
+}
+
+// ThinkingArgs returns the CLI flags for cfg, or nil when cfg is nil or a
+// typed nil pointer.
+func ThinkingArgs(cfg ThinkingConfig) []string {
+	switch c := cfg.(type) {
+	case nil:
+		return nil
+	case *ThinkingConfigAdaptive:
+		if c == nil {
+			return nil
+		}
+	case *ThinkingConfigEnabled:
+		if c == nil {
+			return nil
+		}
+	case *ThinkingConfigDisabled:
+		if c == nil {
+			return nil
+		}
+	}
+	return cfg.thinkingArgs()
+}
 
 // AgentDefinition defines a programmatic subagent.
 type AgentDefinition struct {
@@ -166,7 +261,11 @@ type Options struct {
 	AppendSystemPrompt *string `json:"append_system_prompt,omitempty"`
 	Model              *string `json:"model,omitempty"`
 	FallbackModel      *string `json:"fallback_model,omitempty"`
-	MaxThinkingTokens  int     `json:"max_thinking_tokens,omitempty"`
+	Effort             *string `json:"effort,omitempty"`
+	// Thinking controls extended thinking and takes precedence over MaxThinkingTokens.
+	Thinking ThinkingConfig `json:"-"`
+	// MaxThinkingTokens sets a thinking budget when Thinking is nil; 0 means unset.
+	MaxThinkingTokens int `json:"max_thinking_tokens,omitempty"`
 
 	// Budget & Billing
 	MaxBudgetUSD *float64 `json:"max_budget_usd,omitempty"`
@@ -182,18 +281,27 @@ type Options struct {
 	// Session & State Management
 	ContinueConversation bool            `json:"continue_conversation,omitempty"`
 	Resume               *string         `json:"resume,omitempty"`
+	ResumeSessionAt      *string         `json:"resume_session_at,omitempty"`
+	ResumeDropsTurn      *string         `json:"resume_drops_turn,omitempty"`
 	MaxTurns             int             `json:"max_turns,omitempty"`
 	Settings             *string         `json:"settings,omitempty"`
 	ForkSession          bool            `json:"fork_session,omitempty"`
 	SettingSources       []SettingSource `json:"setting_sources,omitempty"`
 
+	// Skills controls which filesystem-discovered Skills are exposed to the model.
+	// Accepts the string "all" (SkillsAll) to enable every discovered Skill, a
+	// []string of Skill names to enable only those, or an empty []string{} to
+	// disable all. When non-nil and SettingSources is unset, SettingSources
+	// defaults to [user, project] so the CLI discovers installed Skills.
+	// Matches the Python SDK's skills option (see _apply_skills_defaults).
+	Skills any `json:"skills,omitempty"`
+
 	// Partial Message Streaming
 	IncludePartialMessages bool `json:"include_partial_messages,omitempty"`
 
-	// File Checkpointing (Issue #32)
 	// EnableFileCheckpointing enables file change tracking for rewind support.
 	// When enabled, files can be rewound to their state at any user message
-	// using Client.RewindFiles(). Matches Python SDK's enable_file_checkpointing.
+	// using Client.RewindFiles().
 	EnableFileCheckpointing bool `json:"enable_file_checkpointing,omitempty"`
 
 	// Agent Definitions
@@ -235,7 +343,6 @@ type Options struct {
 	// If set, takes precedence over DebugWriter for stderr handling.
 	// Each line is stripped of trailing whitespace and empty lines are skipped.
 	// Callback panics are silently recovered to prevent crashing the SDK.
-	// Matches Python SDK's stderr callback behavior.
 	StderrCallback func(string) `json:"-"` // Not serialized
 
 	// CanUseTool is invoked when CLI requests permission to use a tool.
@@ -243,7 +350,6 @@ type Options struct {
 	// Return PermissionResultAllow to permit, PermissionResultDeny to deny.
 	// If nil, all tool requests are denied (secure default).
 	// Callback panics are recovered to prevent crashing the SDK.
-	// Matches Python SDK's can_use_tool callback behavior.
 	// Note: The actual types are defined in internal/control to avoid import cycles.
 	// Use the claudecode package's WithCanUseTool option for type-safe configuration.
 	CanUseTool func(
@@ -283,6 +389,10 @@ type McpStdioServerConfig struct {
 	Command string            `json:"command"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
+	// AlwaysLoad, when true, opts the server out of tool-search deferral so
+	// all of its tools are always available without a ToolSearch round-trip.
+	// Requires Claude Code CLI 2.1.121 or later.
+	AlwaysLoad bool `json:"alwaysLoad,omitempty"`
 }
 
 // GetType returns the server type for McpStdioServerConfig.
@@ -295,6 +405,10 @@ type McpSSEServerConfig struct {
 	Type    McpServerType     `json:"type"`
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers,omitempty"`
+	// AlwaysLoad, when true, opts the server out of tool-search deferral so
+	// all of its tools are always available without a ToolSearch round-trip.
+	// Requires Claude Code CLI 2.1.121 or later.
+	AlwaysLoad bool `json:"alwaysLoad,omitempty"`
 }
 
 // GetType returns the server type for McpSSEServerConfig.
@@ -307,6 +421,10 @@ type McpHTTPServerConfig struct {
 	Type    McpServerType     `json:"type"`
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers,omitempty"`
+	// AlwaysLoad, when true, opts the server out of tool-search deferral so
+	// all of its tools are always available without a ToolSearch round-trip.
+	// Requires Claude Code CLI 2.1.121 or later.
+	AlwaysLoad bool `json:"alwaysLoad,omitempty"`
 }
 
 // GetType returns the server type for McpHTTPServerConfig.
@@ -337,6 +455,10 @@ type McpSdkServerConfig struct {
 	Type     McpServerType `json:"type"`
 	Name     string        `json:"name"`
 	Instance McpServer     `json:"-"` // Excluded from CLI serialization
+	// AlwaysLoad, when true, opts the server out of tool-search deferral so
+	// all of its tools are always available without a ToolSearch round-trip.
+	// Requires Claude Code CLI 2.1.121 or later.
+	AlwaysLoad bool `json:"alwaysLoad,omitempty"`
 }
 
 // GetType returns the server type for McpSdkServerConfig.
@@ -344,15 +466,35 @@ func (c *McpSdkServerConfig) GetType() McpServerType {
 	return McpServerTypeSdk
 }
 
+// ToolAnnotations carries optional MCP-spec behavioral hints attached by
+// a tool author when defining an SDK MCP tool. Sent to the CLI as part of
+// the JSONRPC tools/list response under the "annotations" key.
+//
+// All fields are pointers so unset fields are omitted from the wire format.
+// See MCP spec:
+// https://modelcontextprotocol.io/specification/2025-03-26/server/tools#tool
+//
+// This is the authoring counterpart to McpToolAnnotations in the control
+// package, which describes annotations as reported back by the CLI in
+// GetMcpStatus responses. The two are kept separate because the CLI strips
+// the "Hint" suffix on status responses, so the wire field sets differ.
+type ToolAnnotations struct {
+	Title           *string `json:"title,omitempty"`
+	ReadOnlyHint    *bool   `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool   `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool   `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool   `json:"openWorldHint,omitempty"`
+}
+
 // McpToolDefinition describes a tool exposed by an MCP server.
 type McpToolDefinition struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"inputSchema"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	InputSchema map[string]any   `json:"inputSchema"`
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
 }
 
 // McpToolResult represents the result of a tool call.
-// Matches Python SDK's tool result structure for 100% parity.
 type McpToolResult struct {
 	Content []McpContent `json:"content"`
 	IsError bool         `json:"isError,omitempty"`
@@ -397,15 +539,13 @@ func (o *Options) Validate() error {
 // NewOptions creates Options with default values.
 func NewOptions() *Options {
 	return &Options{
-		AllowedTools:      []string{},
-		DisallowedTools:   []string{},
-		Betas:             []SdkBeta{},
-		MaxThinkingTokens: DefaultMaxThinkingTokens,
-		AddDirs:           []string{},
-		McpServers:        make(map[string]McpServerConfig),
-		Plugins:           []SdkPluginConfig{},
-		ExtraArgs:         make(map[string]*string),
-		ExtraEnv:          make(map[string]string),
-		SettingSources:    []SettingSource{},
+		AllowedTools:    []string{},
+		DisallowedTools: []string{},
+		Betas:           []SdkBeta{},
+		AddDirs:         []string{},
+		McpServers:      make(map[string]McpServerConfig),
+		Plugins:         []SdkPluginConfig{},
+		ExtraArgs:       make(map[string]*string),
+		ExtraEnv:        make(map[string]string),
 	}
 }

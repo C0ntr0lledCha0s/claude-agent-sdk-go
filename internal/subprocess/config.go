@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/severity1/claude-agent-sdk-go/internal/cli"
 	"github.com/severity1/claude-agent-sdk-go/internal/control"
@@ -19,11 +20,17 @@ func (t *Transport) generateMcpConfigFile() (string, error) {
 	serversForCLI := make(map[string]any)
 	for name, config := range t.options.McpServers {
 		if sdkConfig, ok := config.(*shared.McpSdkServerConfig); ok {
-			// SDK servers: only send type and name to CLI
-			serversForCLI[name] = map[string]any{
+			// SDK servers: only send type and name to CLI (the Go Instance
+			// stays in-process). AlwaysLoad must be propagated explicitly
+			// since we're not relying on struct json tags here.
+			entry := map[string]any{
 				"type": string(sdkConfig.Type),
 				"name": sdkConfig.Name,
 			}
+			if sdkConfig.AlwaysLoad {
+				entry["alwaysLoad"] = true
+			}
+			serversForCLI[name] = entry
 		} else {
 			// External servers: pass as-is
 			serversForCLI[name] = config
@@ -73,154 +80,185 @@ func (t *Transport) GetValidator() *shared.StreamValidator {
 	return t.validator
 }
 
-// SetModel changes the AI model during a streaming session.
-// This method requires control protocol integration which is only available
-// in streaming mode (when closeStdin is false).
+// SetModel changes the AI model during an active session.
 func (t *Transport) SetModel(ctx context.Context, model *string) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if !t.connected {
-		return fmt.Errorf("transport not connected")
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return err
 	}
-
-	// Control protocol integration is only available in streaming mode
-	if t.closeStdin {
-		return fmt.Errorf("SetModel not available in one-shot mode")
-	}
-
-	// Delegate to control protocol
-	if t.protocol == nil {
-		return fmt.Errorf("control protocol not initialized")
-	}
-
-	return t.protocol.SetModel(ctx, model)
+	return protocol.SetModel(ctx, model)
 }
 
-// SetPermissionMode changes the permission mode during a streaming session.
-// This method requires control protocol integration which is only available
-// in streaming mode (when closeStdin is false).
-func (t *Transport) SetPermissionMode(ctx context.Context, mode string) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if !t.connected {
-		return fmt.Errorf("transport not connected")
+// SetPermissionMode changes the permission mode during an active session.
+func (t *Transport) SetPermissionMode(ctx context.Context, mode shared.PermissionMode) error {
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return err
 	}
-
-	// Control protocol integration is only available in streaming mode
-	if t.closeStdin {
-		return fmt.Errorf("SetPermissionMode not available in one-shot mode")
-	}
-
-	// Delegate to control protocol
-	if t.protocol == nil {
-		return fmt.Errorf("control protocol not initialized")
-	}
-
-	return t.protocol.SetPermissionMode(ctx, mode)
+	return protocol.SetPermissionMode(ctx, string(mode))
 }
 
 // RewindFiles reverts tracked files to their state at a specific user message.
-// This method requires control protocol integration which is only available
-// in streaming mode (when closeStdin is false).
-// Returns error if not connected, not in streaming mode, or protocol not initialized.
+// Requires file checkpointing to have been enabled when creating the client.
 func (t *Transport) RewindFiles(ctx context.Context, userMessageID string) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if !t.connected {
-		return fmt.Errorf("transport not connected")
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return err
 	}
+	return protocol.RewindFiles(ctx, userMessageID)
+}
 
-	// Control protocol integration is only available in streaming mode
-	if t.closeStdin {
-		return fmt.Errorf("RewindFiles not available in one-shot mode")
+// GetMcpStatus returns the connection status of all configured MCP servers.
+func (t *Transport) GetMcpStatus(ctx context.Context) (*control.McpStatusResponse, error) {
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return nil, err
 	}
+	return protocol.GetMcpStatus(ctx)
+}
 
-	// Delegate to control protocol
-	if t.protocol == nil {
-		return fmt.Errorf("control protocol not initialized")
+// InitializationResult returns the initialize response the CLI sent during
+// Connect, or nil when the transport is not connected.
+func (t *Transport) InitializationResult() map[string]any {
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return nil
 	}
+	return protocol.InitializationResult()
+}
 
-	return t.protocol.RewindFiles(ctx, userMessageID)
+// StopTask stops a single running task by its task ID.
+func (t *Transport) StopTask(ctx context.Context, taskID string) error {
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return err
+	}
+	return protocol.StopTask(ctx, taskID)
 }
 
 // buildProtocolOptions constructs control protocol options from transport configuration.
-// This extracts callback wiring logic from Connect to reduce cyclomatic complexity.
 func (t *Transport) buildProtocolOptions() []control.ProtocolOption {
 	var opts []control.ProtocolOption
-
-	// Wire permission callback if configured
-	if t.options != nil && t.options.CanUseTool != nil {
-		// Create adapter that converts between shared.Options (any types)
-		// and control package (strongly-typed) to avoid import cycles
-		optionsCallback := t.options.CanUseTool
-		opts = append(opts,
-			control.WithCanUseToolCallback(func(
-				ctx context.Context,
-				toolName string,
-				input map[string]any,
-				permCtx control.ToolPermissionContext,
-			) (control.PermissionResult, error) {
-				// Call the Options callback with any-typed permCtx
-				result, err := optionsCallback(ctx, toolName, input, permCtx)
-				if err != nil {
-					return nil, err
-				}
-
-				// Convert result back to strongly-typed PermissionResult
-				if pr, ok := result.(control.PermissionResult); ok {
-					return pr, nil
-				}
-
-				// Fallback: deny if result type is unexpected
-				return control.NewPermissionResultDeny("invalid permission result type"), nil
-			}))
+	if t.options == nil {
+		return opts
 	}
 
-	// Wire hooks if configured
-	if t.options != nil && t.options.Hooks != nil {
-		// Convert from any to strongly-typed hooks map
-		if hooks, ok := t.options.Hooks.(map[control.HookEvent][]control.HookMatcher); ok {
-			opts = append(opts, control.WithHooks(hooks))
-		}
+	if t.options.CanUseTool != nil {
+		opts = append(opts, control.WithCanUseToolCallback(t.canUseToolAdapter()))
 	}
-
-	// Wire SDK MCP servers to protocol (Issue #7)
-	if t.options != nil && len(t.options.McpServers) > 0 {
-		sdkServers := make(map[string]control.McpServer)
-		for name, config := range t.options.McpServers {
-			if sdkConfig, ok := config.(*shared.McpSdkServerConfig); ok && sdkConfig.Instance != nil {
-				sdkServers[name] = sdkConfig.Instance
-			}
-		}
-		if len(sdkServers) > 0 {
-			opts = append(opts, control.WithSdkMcpServers(sdkServers))
-		}
+	if hooksOpt := t.hooksProtocolOption(); hooksOpt != nil {
+		opts = append(opts, hooksOpt)
 	}
-
+	if mcpOpt := t.sdkMcpServersProtocolOption(); mcpOpt != nil {
+		opts = append(opts, mcpOpt)
+	}
+	if len(t.options.Agents) > 0 {
+		opts = append(opts, control.WithAgents(agentsToMap(t.options.Agents)))
+	}
+	if skillsOpt := t.skillsProtocolOption(); skillsOpt != nil {
+		opts = append(opts, skillsOpt)
+	}
 	return opts
 }
 
-// hasSdkMcpServers checks if any SDK MCP servers are configured.
-// Returns true if at least one SDK server with a valid Instance exists.
-func (t *Transport) hasSdkMcpServers() bool {
-	if t.options == nil || len(t.options.McpServers) == 0 {
-		return false
+// skillsProtocolOption returns the initialize Skills filter, or nil when
+// Skills is not a list. SkillsAll and nil mean no filter (Python query.py).
+func (t *Transport) skillsProtocolOption() control.ProtocolOption {
+	skills, ok := t.options.Skills.([]string)
+	if !ok {
+		return nil
 	}
-	for _, config := range t.options.McpServers {
+	return control.WithSkills(skills)
+}
+
+// canUseToolAdapter wraps the user-facing CanUseTool callback (which uses
+// `any`-typed permCtx/result to avoid import cycles) in a strongly-typed
+// shim acceptable to control.WithCanUseToolCallback.
+func (t *Transport) canUseToolAdapter() control.CanUseToolCallback {
+	optionsCallback := t.options.CanUseTool
+	return func(ctx context.Context, toolName string, input map[string]any, permCtx control.ToolPermissionContext) (control.PermissionResult, error) {
+		result, err := optionsCallback(ctx, toolName, input, permCtx)
+		if err != nil {
+			return nil, err
+		}
+		if pr, ok := result.(control.PermissionResult); ok {
+			return pr, nil
+		}
+		fmt.Fprintf(os.Stderr, "claude-agent-sdk: CanUseTool callback returned unexpected type %T, denying\n", result)
+		return control.NewPermissionResultDeny("invalid permission result type"), nil
+	}
+}
+
+// hooksProtocolOption returns a ProtocolOption wiring up the hook map, or
+// nil when no hooks are configured or the type cast fails (with a warning).
+func (t *Transport) hooksProtocolOption() control.ProtocolOption {
+	if t.options.Hooks == nil {
+		return nil
+	}
+	hooks, ok := t.options.Hooks.(map[control.HookEvent][]control.HookMatcher)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "claude-agent-sdk: Hooks option has unexpected type %T, hooks will not be registered\n", t.options.Hooks)
+		return nil
+	}
+	return control.WithHooks(hooks)
+}
+
+// sdkMcpServersProtocolOption builds the in-process SDK MCP server map and
+// returns a ProtocolOption, or nil if no SDK servers are configured.
+func (t *Transport) sdkMcpServersProtocolOption() control.ProtocolOption {
+	if len(t.options.McpServers) == 0 {
+		return nil
+	}
+	sdkServers := make(map[string]control.McpServer)
+	for name, config := range t.options.McpServers {
 		if sdkConfig, ok := config.(*shared.McpSdkServerConfig); ok && sdkConfig.Instance != nil {
-			return true
+			sdkServers[name] = sdkConfig.Instance
 		}
 	}
-	return false
+	if len(sdkServers) == 0 {
+		return nil
+	}
+	return control.WithSdkMcpServers(sdkServers)
+}
+
+// agentsToMap converts the typed Options.Agents map into the
+// map[string]any shape consumed by the control protocol.
+//
+// Stripping rule: description and prompt always emit (Go strings, no
+// nil/None distinction); empty Tools slice and empty Model string are
+// dropped. This is stricter than Python's `if v is not None` rule
+// (Python preserves empty list and empty string), but acceptable
+// because Go's AgentDefinition uses zero-value-as-unset semantics. The
+// per-field strip decision should be re-examined when AgentDefinition
+// gains nullable optional fields.
+func agentsToMap(agents map[string]shared.AgentDefinition) map[string]any {
+	out := make(map[string]any, len(agents))
+	for name, agent := range agents {
+		entry := map[string]any{
+			"description": agent.Description,
+			"prompt":      agent.Prompt,
+		}
+		if len(agent.Tools) > 0 {
+			entry["tools"] = agent.Tools
+		}
+		if agent.Model != "" {
+			entry["model"] = string(agent.Model)
+		}
+		out[name] = entry
+	}
+	return out
 }
 
 // buildEnvironment constructs the environment variables for the subprocess.
-// This extracts environment setup logic from Connect to reduce cyclomatic complexity.
 func (t *Transport) buildEnvironment() []string {
-	env := os.Environ()
+	// Drop the inherited CLAUDECODE guard so an SDK run inside a Claude Code
+	// session can start the CLI; ExtraEnv can set it again (Python #732).
+	var env []string
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "CLAUDECODE=") {
+			env = append(env, entry)
+		}
+	}
 
 	// Set entrypoint to identify SDK to CLI
 	env = append(env, "CLAUDE_CODE_ENTRYPOINT="+t.entrypoint)
@@ -236,6 +274,9 @@ func (t *Transport) buildEnvironment() []string {
 			env = append(env, fmt.Sprintf("%s=%s", key, value))
 		}
 	}
+
+	// Set last so ExtraEnv cannot override it (Python #184).
+	env = append(env, "CLAUDE_AGENT_SDK_VERSION="+shared.SDKVersion)
 
 	return env
 }

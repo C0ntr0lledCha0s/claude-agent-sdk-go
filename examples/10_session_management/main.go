@@ -10,8 +10,6 @@
 //  2. CLI Session UUID - The persistent conversation identifier returned in
 //     ResultMessage.SessionID. This appears in Claude Code UI and is used with
 //     WithResume() to continue conversations ACROSS client connections.
-//
-// The Python SDK follows the same pattern with ClaudeSDKClient.query(session_id="default").
 package main
 
 import (

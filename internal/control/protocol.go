@@ -4,13 +4,19 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
 
 // DefaultInitTimeout is the default timeout for the Initialize handshake.
 const DefaultInitTimeout = 60 * time.Second
+
+// ErrProtocolClosed is returned by a control request that is sent after Close,
+// or that is still waiting for its response when Close runs.
+var ErrProtocolClosed = errors.New("control protocol closed")
 
 // Transport abstracts the I/O operations for the control protocol.
 // This allows testing with mock transports.
@@ -33,29 +39,44 @@ type Protocol struct {
 	pendingRequests map[string]chan *Response
 	requestCounter  int64
 
+	// inflightRequests maps an incoming control request ID to the cancel func
+	// of its handler goroutine (Python: Query._inflight_requests).
+	inflightRequests map[string]context.CancelFunc
+
 	// Message routing
 	messageStream chan map[string]any
 
 	// State
 	initialized  bool
+	initOnce     sync.Once
+	initErr      error
 	initResponse *InitializeResponse
+	initResult   map[string]any // the whole initialize response
+	initErrChan  chan error
 	closed       bool
+	closedCh     chan struct{} // closed by Close; wakes pending requests
 	started      bool
 
 	// Configuration
 	initTimeout time.Duration
 
-	// Permission callback (Issue #8)
+	// Permission callback
 	canUseToolCallback CanUseToolCallback
 
-	// Hook callbacks (Issue #9)
+	// Hook callbacks
 	hooks            map[HookEvent][]HookMatcher
 	hookCallbacks    map[string]HookCallback
 	hookCallbacksMu  sync.RWMutex
 	nextHookCallback int64
 
-	// SDK MCP servers for in-process tool handling (Issue #7)
+	// SDK MCP servers for in-process tool handling
 	sdkMcpServers map[string]McpServer
+
+	// agents travel in the initialize control request, bypassing argv size limits.
+	agents map[string]any
+
+	// skills is sent in initialize only when set; nil means no filter.
+	skills *[]string
 
 	// Background goroutine management
 	ctx    context.Context
@@ -105,13 +126,34 @@ func WithSdkMcpServers(servers map[string]McpServer) ProtocolOption {
 	}
 }
 
+// WithAgents configures agent definitions to be sent in the initialize
+// request. Agents travel via the control protocol over stdin so the
+// payload size is bounded by stdin buffering rather than argv limits.
+func WithAgents(agents map[string]any) ProtocolOption {
+	return func(p *Protocol) {
+		p.agents = agents
+	}
+}
+
+// WithSkills configures the Skills filter sent in the initialize request.
+// An empty list disables all Skills.
+func WithSkills(skills []string) ProtocolOption {
+	return func(p *Protocol) {
+		list := append([]string{}, skills...)
+		p.skills = &list
+	}
+}
+
 // NewProtocol creates a new control protocol handler.
 func NewProtocol(transport Transport, opts ...ProtocolOption) *Protocol {
 	p := &Protocol{
-		transport:       transport,
-		pendingRequests: make(map[string]chan *Response),
-		messageStream:   make(chan map[string]any, 100),
-		initTimeout:     DefaultInitTimeout,
+		transport:        transport,
+		pendingRequests:  make(map[string]chan *Response),
+		inflightRequests: make(map[string]context.CancelFunc),
+		messageStream:    make(chan map[string]any, 100),
+		initTimeout:      DefaultInitTimeout,
+		initErrChan:      make(chan error, 1),
+		closedCh:         make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -159,13 +201,13 @@ func (p *Protocol) readLoop() {
 			// Parse the incoming message
 			var msg map[string]any
 			if err := json.Unmarshal(data, &msg); err != nil {
-				// Log parse error but continue
+				fmt.Fprintf(os.Stderr, "claude-agent-sdk: failed to parse control message: %v\n", err)
 				continue
 			}
 
 			// Route the message
-			if err := p.HandleIncomingMessage(p.ctx, msg); err != nil {
-				// Log routing error but continue
+			if err := p.HandleIncomingMessageAsync(p.ctx, msg); err != nil {
+				fmt.Fprintf(os.Stderr, "claude-agent-sdk: failed to route control message: %v\n", err)
 				continue
 			}
 		}
@@ -196,6 +238,10 @@ func (p *Protocol) SendControlRequest(ctx context.Context, request any, timeout 
 	responseChan := make(chan *Response, 1)
 
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, ErrProtocolClosed
+	}
 	p.pendingRequests[requestID] = responseChan
 	p.mu.Unlock()
 
@@ -232,18 +278,67 @@ func (p *Protocol) SendControlRequest(ctx context.Context, request any, timeout 
 
 	select {
 	case response := <-responseChan:
+		if response.failure != nil {
+			return nil, response.failure
+		}
 		if response.Subtype == ResponseSubtypeError {
 			return nil, fmt.Errorf("control request error: %s", response.Error)
 		}
 		return response.Response, nil
+
+	case err := <-p.initErrChan:
+		return nil, err
+
+	case <-p.closedCh:
+		return nil, ErrProtocolClosed
 
 	case <-timeoutCtx.Done():
 		return nil, fmt.Errorf("control request timeout: %w", timeoutCtx.Err())
 	}
 }
 
+// HandleControlInitErr reports an initialization error back to any pending
+// SendControlRequest, unblocking it when the CLI returns an error result
+// instead of a control protocol response (e.g., invalid session ID).
+//
+// No-op once the handshake has succeeded: a late stdout-close notification
+// after a successful Initialize must not poison `initErrChan` for the next
+// SendControlRequest (e.g. SetModel/GetMcpStatus from a long-lived client).
+func (p *Protocol) HandleControlInitErr(err error) {
+	p.mu.Lock()
+	initialized := p.initialized
+	p.mu.Unlock()
+	if initialized {
+		return
+	}
+	select {
+	case p.initErrChan <- err:
+	default:
+	}
+}
+
+// FailPendingRequests fails every control request still waiting for a response
+// with err, because the CLI's stream ended with that error (Python: the reader
+// sets its error on every pending request). A request still waiting for the
+// initialize handshake is left alone: HandleControlInitErr already fails it.
+func (p *Protocol) FailPendingRequests(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.initialized {
+		return
+	}
+	for requestID, responseChan := range p.pendingRequests {
+		select {
+		case responseChan <- &Response{RequestID: requestID, failure: err}:
+		default:
+		}
+	}
+}
+
 // HandleIncomingMessage routes incoming messages based on their type.
 // Control messages are handled internally, regular messages are forwarded to the stream.
+// Incoming control requests run on the caller's goroutine; read loops must use
+// HandleIncomingMessageAsync instead.
 func (p *Protocol) HandleIncomingMessage(ctx context.Context, msg map[string]any) error {
 	msgType, ok := msg["type"].(string)
 	if !ok {
@@ -261,6 +356,71 @@ func (p *Protocol) HandleIncomingMessage(ctx context.Context, msg map[string]any
 		// Regular SDK message - forward to stream
 		return p.forwardToStream(ctx, msg)
 	}
+}
+
+// HandleIncomingMessageAsync routes messages like HandleIncomingMessage, but runs
+// each incoming control request on its own goroutine, so a slow hook, permission
+// or SDK MCP callback cannot stall the reader (Python: spawn_task per request).
+// Control responses and regular messages are still routed inline, in read order.
+func (p *Protocol) HandleIncomingMessageAsync(ctx context.Context, msg map[string]any) error {
+	if msgType, _ := msg["type"].(string); msgType != MessageTypeControlRequest {
+		return p.HandleIncomingMessage(ctx, msg)
+	}
+
+	requestID, _ := msg["request_id"].(string)
+	requestCtx, cancel := context.WithCancel(ctx)
+	if !p.trackInflight(requestID, cancel) {
+		cancel()
+		return nil
+	}
+
+	go func() {
+		defer p.untrackInflight(requestID)
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				p.replyHandlerFailure(requestCtx, requestID, fmt.Errorf("control request handler panicked: %v", r))
+			}
+		}()
+		if err := p.handleIncomingControlRequest(requestCtx, msg); err != nil {
+			p.replyHandlerFailure(requestCtx, requestID, err)
+		}
+	}()
+	return nil
+}
+
+// replyHandlerFailure answers the CLI with an error so its request does not
+// hang. A cancelled handler writes nothing: the CLI or Close abandoned it.
+func (p *Protocol) replyHandlerFailure(ctx context.Context, requestID string, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "claude-agent-sdk: failed to handle control request: %v\n", err)
+	if requestID == "" {
+		return
+	}
+	if writeErr := p.sendErrorResponse(ctx, requestID, err.Error()); writeErr != nil {
+		fmt.Fprintf(os.Stderr, "claude-agent-sdk: failed to send control error response: %v\n", writeErr)
+	}
+}
+
+// trackInflight registers a handler's cancel func. Returns false after Close.
+func (p *Protocol) trackInflight(requestID string, cancel context.CancelFunc) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return false
+	}
+	if requestID != "" {
+		p.inflightRequests[requestID] = cancel
+	}
+	return true
+}
+
+func (p *Protocol) untrackInflight(requestID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.inflightRequests, requestID)
 }
 
 // handleIncomingControlRequest routes incoming control requests from CLI.
@@ -281,8 +441,8 @@ func (p *Protocol) handleIncomingControlRequest(ctx context.Context, msg map[str
 	case SubtypeMcpMessage:
 		return p.handleMcpMessageRequest(ctx, requestID, request)
 	default:
-		// Unknown subtype - ignore for forward compatibility
-		return nil
+		// Python raises here, which sends an error response to the CLI.
+		return fmt.Errorf("unsupported control request subtype: %s", subtype)
 	}
 }
 
@@ -327,19 +487,22 @@ func (p *Protocol) handleControlResponse(_ context.Context, msg map[string]any) 
 	select {
 	case responseChan <- response:
 	default:
-		// Channel full or closed - ignore
+		fmt.Fprintf(os.Stderr, "claude-agent-sdk: response channel full or closed, dropping response for request %s\n", requestID)
 	}
 
 	return nil
 }
 
 // forwardToStream sends a message to the regular message stream.
+// Returns an error if the buffer is full rather than blocking readLoop.
 func (p *Protocol) forwardToStream(ctx context.Context, msg map[string]any) error {
 	select {
 	case p.messageStream <- msg:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	default:
+		return fmt.Errorf("message stream buffer full, dropping message")
 	}
 }
 
@@ -360,41 +523,47 @@ func (p *Protocol) sendErrorResponse(ctx context.Context, requestID string, errM
 		return fmt.Errorf("failed to marshal error response: %w", err)
 	}
 
+	return p.writeControlResponse(ctx, data)
+}
+
+// writeControlResponse writes a response line unless the handler was cancelled:
+// the CLI or Close abandoned the request, so it gets no reply (Python parity).
+func (p *Protocol) writeControlResponse(ctx context.Context, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return p.transport.Write(ctx, append(data, '\n'))
 }
 
 // Initialize performs the control protocol handshake with the CLI.
 // This must be called in streaming mode before other control operations.
-// The result is cached - subsequent calls return the cached response.
+// The result is cached via sync.Once - concurrent and subsequent calls return the cached
+// response. If the first call fails, the error is also cached permanently; subsequent
+// calls return the same error and will not retry even with a fresh context.
 func (p *Protocol) Initialize(ctx context.Context) (*InitializeResponse, error) {
-	p.mu.Lock()
-	if p.initialized {
-		resp := p.initResponse
-		p.mu.Unlock()
-		return resp, nil
-	}
-	p.mu.Unlock()
+	p.initOnce.Do(func() {
+		// Hooks is always assigned (nil when none registered) so the
+		// wire body always carries the `"hooks"` key.
+		initReq := InitializeRequest{
+			Subtype: SubtypeInitialize,
+			Hooks:   p.buildHooksConfig(),
+		}
 
-	// Build initialize request with hooks configuration
-	initReq := InitializeRequest{
-		Subtype: SubtypeInitialize,
-	}
+		if len(p.agents) > 0 {
+			initReq.Agents = p.agents
+		}
+		initReq.Skills = p.skills
 
-	// Generate hook registrations and build hooks config
-	if p.hooks != nil {
-		initReq.Hooks = p.buildHooksConfig()
-	}
+		// Send initialize request
+		result, err := p.SendControlRequest(ctx, initReq, p.initTimeout)
+		if err != nil {
+			p.initErr = fmt.Errorf("initialize failed: %w", err)
+			return
+		}
 
-	// Send initialize request
-	result, err := p.SendControlRequest(ctx, initReq, p.initTimeout)
-
-	if err != nil {
-		return nil, fmt.Errorf("initialize failed: %w", err)
-	}
-
-	// Parse response
-	var initResp InitializeResponse
-	if resultMap, ok := result.(map[string]any); ok {
+		// Parse response
+		var initResp InitializeResponse
+		resultMap, _ := result.(map[string]any)
 		if cmds, ok := resultMap["supported_commands"].([]any); ok {
 			for _, cmd := range cmds {
 				if cmdStr, ok := cmd.(string); ok {
@@ -402,14 +571,60 @@ func (p *Protocol) Initialize(ctx context.Context) (*InitializeResponse, error) 
 				}
 			}
 		}
-	}
+
+		p.mu.Lock()
+		p.initialized = true
+		p.initResponse = &initResp
+		p.initResult = resultMap
+		p.mu.Unlock()
+	})
 
 	p.mu.Lock()
-	p.initialized = true
-	p.initResponse = &initResp
+	resp := p.initResponse
+	err := p.initErr
 	p.mu.Unlock()
 
-	return &initResp, nil
+	return resp, err
+}
+
+// InitializationResult returns the initialize response the CLI sent: its
+// commands, output styles, models, account and other capabilities (Python:
+// Query._initialization_result). It is nil before the handshake completes.
+// Each call returns a copy the caller may modify.
+func (p *Protocol) InitializationResult() map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.initResult == nil {
+		return nil
+	}
+	return copyJSONValue(p.initResult).(map[string]any)
+}
+
+// copyJSONValue deep-copies a value decoded by encoding/json into any.
+func copyJSONValue(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(v))
+		for k, e := range v {
+			m[k] = copyJSONValue(e)
+		}
+		return m
+	case []any:
+		s := make([]any, len(v))
+		for i, e := range v {
+			s[i] = copyJSONValue(e)
+		}
+		return s
+	default:
+		return v
+	}
+}
+
+// IsInitialized reports whether the initialize handshake completed.
+func (p *Protocol) IsInitialized() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.initialized
 }
 
 // Interrupt sends an interrupt control request to the CLI.
@@ -445,19 +660,48 @@ func (p *Protocol) SetPermissionMode(ctx context.Context, mode string) error {
 	return err
 }
 
+// GetMcpStatus returns the connection status of all configured MCP servers.
+func (p *Protocol) GetMcpStatus(ctx context.Context) (*McpStatusResponse, error) {
+	result, err := p.SendControlRequest(ctx, NewGetMcpStatusRequest(), 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, fmt.Errorf("mcp status response: CLI returned empty response")
+	}
+	// SendControlRequest returns Response.Response as any (map[string]any from JSON).
+	// Re-marshal + unmarshal into typed struct - necessary because SendControlRequest
+	// returns any and there is no generic typed variant.
+	data, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("marshal mcp status response: %w", err)
+	}
+	var resp McpStatusResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshal mcp status response: %w", err)
+	}
+	return &resp, nil
+}
+
 // RewindFiles reverts tracked files to their state at a specific user message.
 // The userMessageID should be the UUID from a UserMessage received during the session.
 // Requires EnableFileCheckpointing to be set when creating the client.
 // Returns error if the control request fails or times out.
-//
-// This method matches Python SDK's rewind_files behavior exactly:
-// - Uses "rewind_files" subtype
-// - Sends user_message_id in the request
-// - Uses standard 5-second timeout
 func (p *Protocol) RewindFiles(ctx context.Context, userMessageID string) error {
 	_, err := p.SendControlRequest(ctx, RewindFilesRequest{
 		Subtype:       SubtypeRewindFiles,
 		UserMessageID: userMessageID,
+	}, 5*time.Second)
+
+	return err
+}
+
+// StopTask stops a single running task by the task_id from its task_started
+// system message. Returns error if the control request fails or times out.
+func (p *Protocol) StopTask(ctx context.Context, taskID string) error {
+	_, err := p.SendControlRequest(ctx, StopTaskRequest{
+		Subtype: SubtypeStopTask,
+		TaskID:  taskID,
 	}, 5*time.Second)
 
 	return err
@@ -483,6 +727,13 @@ func (p *Protocol) Close() error {
 		return nil
 	}
 	p.closed = true
+	close(p.closedCh)
+	// Cancel in-flight handlers without waiting: a user callback that ignores
+	// ctx must not block Close (Python close() cancels child tasks too).
+	for requestID, cancel := range p.inflightRequests {
+		cancel()
+		delete(p.inflightRequests, requestID)
+	}
 	p.mu.Unlock()
 
 	// Cancel background goroutines

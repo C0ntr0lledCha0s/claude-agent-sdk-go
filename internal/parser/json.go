@@ -16,7 +16,6 @@ const (
 )
 
 // Parser handles JSON message parsing with speculative parsing and buffer management.
-// It implements the same speculative parsing strategy as the Python SDK.
 type Parser struct {
 	buffer        strings.Builder
 	maxBufferSize int
@@ -27,6 +26,13 @@ type Parser struct {
 func New() *Parser {
 	return &Parser{
 		maxBufferSize: MaxBufferSize,
+	}
+}
+
+// NewWithSize creates a new JSON parser with a custom maximum buffer size.
+func NewWithSize(maxBufferSize int) *Parser {
+	return &Parser{
+		maxBufferSize: maxBufferSize,
 	}
 }
 
@@ -65,7 +71,8 @@ func (p *Parser) ProcessLine(line string) ([]shared.Message, error) {
 }
 
 // ParseMessage parses a raw JSON object into the appropriate Message type.
-// Implements type discrimination based on the "type" field.
+// Implements type discrimination based on the "type" field. An unknown type
+// returns a nil Message and a nil error, so a newer CLI does not break the stream.
 func (p *Parser) ParseMessage(data map[string]any) (shared.Message, error) {
 	msgType, ok := data["type"].(string)
 	if !ok {
@@ -89,11 +96,12 @@ func (p *Parser) ParseMessage(data map[string]any) (shared.Message, error) {
 		}, nil
 	case shared.MessageTypeStreamEvent:
 		return p.parseStreamEventMessage(data)
+	case shared.MessageTypeRateLimitEvent:
+		return p.parseRateLimitEventMessage(data)
+	case shared.MessageTypeConversationReset:
+		return parseConversationResetMessage(data)
 	default:
-		return nil, shared.NewMessageParseError(
-			fmt.Sprintf("unknown message type: %s", msgType),
-			data,
-		)
+		return nil, nil
 	}
 }
 
@@ -109,6 +117,16 @@ func (p *Parser) BufferSize() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.buffer.Len()
+}
+
+// NewBufferOverflowError returns the error for a stdout message longer than
+// limit bytes. The text matches the Python SDK, so callers can match on it.
+func NewBufferOverflowError(limit int, cause error) *shared.JSONDecodeError {
+	return shared.NewJSONDecodeError(
+		fmt.Sprintf("JSON message exceeded maximum buffer size of %d bytes", limit),
+		0,
+		cause,
+	)
 }
 
 // processJSONLine attempts to parse accumulated buffer as JSON using speculative parsing.
@@ -129,9 +147,8 @@ func (p *Parser) processJSONLineUnlocked(jsonLine string) (shared.Message, error
 	if p.buffer.Len() > p.maxBufferSize {
 		bufferSize := p.buffer.Len()
 		p.buffer.Reset()
-		return nil, shared.NewJSONDecodeError(
-			"buffer overflow",
-			0,
+		return nil, NewBufferOverflowError(
+			p.maxBufferSize,
 			fmt.Errorf("buffer size %d exceeds limit %d", bufferSize, p.maxBufferSize),
 		)
 	}
@@ -174,7 +191,6 @@ func (p *Parser) parseUserMessage(data map[string]any) (*shared.UserMessage, err
 		parentToolUseID = &ptid
 	}
 
-	// Extract tool_use_result (Issue #98: Python SDK v0.1.22 parity)
 	var toolUseResult map[string]any
 	if tur, ok := data["tool_use_result"].(map[string]any); ok {
 		toolUseResult = tur
@@ -192,13 +208,9 @@ func (p *Parser) parseUserMessage(data map[string]any) (*shared.UserMessage, err
 		}, nil
 	case []any:
 		// Array of content blocks
-		blocks := make([]shared.ContentBlock, len(c))
-		for i, blockData := range c {
-			block, err := p.parseContentBlock(blockData)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse content block %d: %w", i, err)
-			}
-			blocks[i] = block
+		blocks, err := p.parseContentBlocks(c)
+		if err != nil {
+			return nil, err
 		}
 		return &shared.UserMessage{
 			Content:         blocks,
@@ -228,40 +240,60 @@ func (p *Parser) parseAssistantMessage(data map[string]any) (*shared.AssistantMe
 		return nil, shared.NewMessageParseError("assistant message missing model field", data)
 	}
 
-	blocks := make([]shared.ContentBlock, len(contentArray))
-	for i, blockData := range contentArray {
-		block, err := p.parseContentBlock(blockData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse content block %d: %w", i, err)
-		}
-		blocks[i] = block
+	blocks, err := p.parseContentBlocks(contentArray)
+	if err != nil {
+		return nil, err
 	}
 
-	// Parse optional error field
+	// Parse optional error field from top-level data, not the nested message object.
+	// Wire format: {"type":"assistant","error":"rate_limit","message":{...}}.
 	var errorPtr *shared.AssistantMessageError
-	if errorStr, ok := messageData["error"].(string); ok {
+	if errorStr, ok := data["error"].(string); ok {
 		errType := shared.AssistantMessageError(errorStr)
 		errorPtr = &errType
 	}
 
+	// parent_tool_use_id is set on assistant messages produced inside a subagent
+	// (Agent/Task tool). Lives at the top-level of the raw event.
+	var parentToolUseID *string
+	if ptid, ok := data["parent_tool_use_id"].(string); ok {
+		parentToolUseID = &ptid
+	}
+
+	// usage is nested under the message object (unlike ResultMessage, where it
+	// is top-level): {"type":"assistant","message":{...,"usage":{...}}}.
+	var usage *map[string]any
+	if u, ok := messageData["usage"].(map[string]any); ok {
+		usage = &u
+	}
+
 	return &shared.AssistantMessage{
-		Content: blocks,
-		Model:   model,
-		Error:   errorPtr,
+		Content:         blocks,
+		Model:           model,
+		Error:           errorPtr,
+		ParentToolUseID: parentToolUseID,
+		Usage:           usage,
 	}, nil
 }
 
-// parseSystemMessage parses a system message from raw JSON data.
+// parseSystemMessage parses a system message from raw JSON data. A
+// task_started, task_progress or task_notification message that lacks a
+// required field is a parse error; the typed forms come from the
+// SystemMessage's AsTask* methods.
 func (p *Parser) parseSystemMessage(data map[string]any) (*shared.SystemMessage, error) {
 	subtype, ok := data["subtype"].(string)
 	if !ok {
 		return nil, shared.NewMessageParseError("system message missing subtype field", data)
 	}
 
-	return &shared.SystemMessage{
+	msg := &shared.SystemMessage{
 		Subtype: subtype,
 		Data:    data, // Preserve all original data
-	}, nil
+	}
+	if err := shared.ValidateTaskMessage(msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
 }
 
 // parseResultMessage parses a result message from raw JSON data.
@@ -325,10 +357,35 @@ func (p *Parser) parseResultMessage(data map[string]any) (*shared.ResultMessage,
 		result.StructuredOutput = structuredOutput
 	}
 
+	// Parse errors array
+	if errorsRaw, ok := data["errors"].([]any); ok {
+		for _, e := range errorsRaw {
+			if s, ok := e.(string); ok {
+				result.Errors = append(result.Errors, s)
+			}
+		}
+	}
+
 	return result, nil
 }
 
-// parseContentBlock parses a content block based on its type field.
+// parseContentBlocks parses content blocks and drops blocks of an unknown type.
+func (p *Parser) parseContentBlocks(raw []any) ([]shared.ContentBlock, error) {
+	blocks := make([]shared.ContentBlock, 0, len(raw))
+	for i, blockData := range raw {
+		block, err := p.parseContentBlock(blockData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse content block %d: %w", i, err)
+		}
+		if block != nil {
+			blocks = append(blocks, block)
+		}
+	}
+	return blocks, nil
+}
+
+// parseContentBlock parses a content block based on its type field. An
+// unknown type returns a nil block and a nil error.
 func (p *Parser) parseContentBlock(blockData any) (shared.ContentBlock, error) {
 	data, ok := blockData.(map[string]any)
 	if !ok {
@@ -349,11 +406,12 @@ func (p *Parser) parseContentBlock(blockData any) (shared.ContentBlock, error) {
 		return p.parseToolUseBlock(data)
 	case shared.ContentBlockTypeToolResult:
 		return p.parseToolResultBlock(data)
+	case shared.ContentBlockTypeServerToolUse:
+		return parseServerToolUseBlock(data)
+	case shared.ContentBlockTypeAdvisorToolResult:
+		return parseServerToolResultBlock(data)
 	default:
-		return nil, shared.NewMessageParseError(
-			fmt.Sprintf("unknown content block type: %s", blockType),
-			data,
-		)
+		return nil, nil
 	}
 }
 
@@ -397,6 +455,43 @@ func (p *Parser) parseToolUseBlock(data map[string]any) (shared.ContentBlock, er
 	}, nil
 }
 
+func parseServerToolUseBlock(data map[string]any) (shared.ContentBlock, error) {
+	id, ok := data["id"].(string)
+	if !ok {
+		return nil, shared.NewMessageParseError("server_tool_use block missing id field", data)
+	}
+	name, ok := data["name"].(string)
+	if !ok {
+		return nil, shared.NewMessageParseError("server_tool_use block missing name field", data)
+	}
+	input, ok := data["input"].(map[string]any)
+	if !ok {
+		return nil, shared.NewMessageParseError("server_tool_use block missing input field", data)
+	}
+	return &shared.ServerToolUseBlock{
+		MessageType: shared.ContentBlockTypeServerToolUse,
+		ID:          id,
+		Name:        shared.ServerToolName(name),
+		Input:       input,
+	}, nil
+}
+
+func parseServerToolResultBlock(data map[string]any) (shared.ContentBlock, error) {
+	toolUseID, ok := data["tool_use_id"].(string)
+	if !ok {
+		return nil, shared.NewMessageParseError("advisor_tool_result block missing tool_use_id field", data)
+	}
+	content, ok := data["content"].(map[string]any)
+	if !ok {
+		return nil, shared.NewMessageParseError("advisor_tool_result block missing content field", data)
+	}
+	return &shared.ServerToolResultBlock{
+		MessageType: shared.ContentBlockTypeAdvisorToolResult,
+		ToolUseID:   toolUseID,
+		Content:     content,
+	}, nil
+}
+
 func (p *Parser) parseToolResultBlock(data map[string]any) (shared.ContentBlock, error) {
 	toolUseID, ok := data["tool_use_id"].(string)
 	if !ok {
@@ -415,6 +510,67 @@ func (p *Parser) parseToolResultBlock(data map[string]any) (shared.ContentBlock,
 		Content:   data["content"],
 		IsError:   isError,
 	}, nil
+}
+
+// parseRateLimitEventMessage parses a rate_limit_event message from raw JSON
+// data. Tolerant on optional fields: only the rate_limit_info object is
+// required; uuid / session_id are best-effort copies because the CLI does
+// not always include them depending on session state.
+func parseConversationResetMessage(data map[string]any) (*shared.ConversationResetMessage, error) {
+	fields := [3]string{"new_conversation_id", "uuid", "session_id"}
+	var values [3]string
+	for i, field := range fields {
+		value, ok := data[field].(string)
+		if !ok {
+			return nil, shared.NewMessageParseError(
+				fmt.Sprintf("conversation_reset message missing %s field", field), data)
+		}
+		values[i] = value
+	}
+	return &shared.ConversationResetMessage{
+		MessageType:       shared.MessageTypeConversationReset,
+		NewConversationID: values[0],
+		UUID:              values[1],
+		SessionID:         values[2],
+	}, nil
+}
+
+func (p *Parser) parseRateLimitEventMessage(data map[string]any) (*shared.RateLimitEventMessage, error) {
+	infoRaw, ok := data["rate_limit_info"].(map[string]any)
+	if !ok {
+		return nil, shared.NewMessageParseError("rate_limit_event missing rate_limit_info field", data)
+	}
+
+	info := shared.RateLimitInfo{}
+	if s, ok := infoRaw["status"].(string); ok {
+		info.Status = s
+	}
+	if f, ok := infoRaw["resetsAt"].(float64); ok {
+		info.ResetsAt = int64(f)
+	}
+	if s, ok := infoRaw["rateLimitType"].(string); ok {
+		info.RateLimitType = s
+	}
+	if s, ok := infoRaw["overageStatus"].(string); ok {
+		info.OverageStatus = s
+	}
+	if f, ok := infoRaw["overageResetsAt"].(float64); ok {
+		info.OverageResetsAt = int64(f)
+	}
+	if b, ok := infoRaw["isUsingOverage"].(bool); ok {
+		info.IsUsingOverage = b
+	}
+
+	msg := &shared.RateLimitEventMessage{
+		RateLimitInfo: info,
+	}
+	if s, ok := data["uuid"].(string); ok {
+		msg.UUID = s
+	}
+	if s, ok := data["session_id"].(string); ok {
+		msg.SessionID = s
+	}
+	return msg, nil
 }
 
 // parseStreamEventMessage parses a stream event message from raw JSON data.

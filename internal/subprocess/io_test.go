@@ -1,8 +1,11 @@
 package subprocess
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -11,14 +14,88 @@ import (
 	"github.com/severity1/claude-agent-sdk-go/internal/shared"
 )
 
+// TestFormatInitError tests the error message formatting for early init failures.
+func TestFormatInitError(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      *shared.ResultMessage
+		expected string
+	}{
+		{
+			name: "uses_errors_field",
+			msg: &shared.ResultMessage{
+				IsError: true,
+				Errors:  []string{"No conversation found with session ID: abc-123"},
+				Subtype: "error",
+			},
+			expected: "No conversation found with session ID: abc-123",
+		},
+		{
+			name: "joins_multiple_errors",
+			msg: &shared.ResultMessage{
+				IsError: true,
+				Errors:  []string{"error one", "error two"},
+				Subtype: "error",
+			},
+			expected: "error one; error two",
+		},
+		{
+			name: "falls_back_to_result",
+			msg: &shared.ResultMessage{
+				IsError: true,
+				Errors:  nil,
+				Result:  strPtr("something went wrong"),
+				Subtype: "error",
+			},
+			expected: "something went wrong",
+		},
+		{
+			name: "falls_back_to_subtype",
+			msg: &shared.ResultMessage{
+				IsError: true,
+				Errors:  nil,
+				Result:  nil,
+				Subtype: "fatal",
+			},
+			expected: "initialization failed with subtype: fatal",
+		},
+		{
+			name: "empty_errors_falls_back_to_result",
+			msg: &shared.ResultMessage{
+				IsError: true,
+				Errors:  []string{},
+				Result:  strPtr("fallback message"),
+				Subtype: "error",
+			},
+			expected: "fallback message",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatInitError(tc.msg)
+			if got != tc.expected {
+				t.Errorf("expected %q, got %q", tc.expected, got)
+			}
+		})
+	}
+}
+
+func strPtr(s string) *string {
+	return &s
+}
+
 // TestTransportHandleStdoutErrorPaths tests uncovered handleStdout scenarios
 func TestTransportHandleStdoutErrorPaths(t *testing.T) {
-	ctx, cancel := setupTransportTestContext(t, 5*time.Second)
+	// Generous timeout: subtests spawn the test binary as mock CLI; under
+	// -race each spawn costs ~hundreds of ms (vs sub-ms for the legacy bash
+	// fixture), so the shared parent context budget needs headroom.
+	ctx, cancel := setupTransportTestContext(t, 30*time.Second)
 	defer cancel()
 
 	// Test stdout parsing errors
 	t.Run("stdout_parsing_errors", func(t *testing.T) {
-		transport := setupTransportForTest(t, newTransportMockCLIWithOptions(WithInvalidOutput()))
+		transport := setupTransportForTest(t, newTransportMockCLIWithOptions(t, WithInvalidOutput()))
 		defer disconnectTransportSafely(t, transport)
 
 		connectTransportSafely(ctx, t, transport)
@@ -48,7 +125,7 @@ func TestTransportHandleStdoutErrorPaths(t *testing.T) {
 
 	// Test scanner error conditions
 	t.Run("scanner_error_handling", func(t *testing.T) {
-		transport := setupTransportForTest(t, newTransportMockCLI())
+		transport := setupTransportForTest(t, newTransportMockCLI(t))
 		defer disconnectTransportSafely(t, transport)
 
 		connectTransportSafely(ctx, t, transport)
@@ -88,7 +165,7 @@ func TestTransportHandleStdoutErrorPaths(t *testing.T) {
 	})
 }
 
-// TestStderrCallbackHandling tests stderr callback processing (Issue #53)
+// TestStderrCallbackHandling tests stderr callback processing.
 func TestStderrCallbackHandling(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -161,6 +238,30 @@ func TestStderrCallbackHandling(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestStderrCallbackDeliversLinesAfterCancel verifies stderr lines already in
+// the pipe reach the callback after the transport context is cancelled, as in
+// the Python SDK. A failed Connect cancels the context right away.
+func TestStderrCallbackDeliversLinesAfterCancel(t *testing.T) {
+	var received []string
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	transport := &Transport{
+		ctx:        ctx,
+		stderrPipe: io.NopCloser(strings.NewReader("first\nsecond\npartial")),
+		options: &shared.Options{
+			StderrCallback: func(line string) { received = append(received, line) },
+		},
+	}
+
+	transport.wg.Add(1)
+	transport.handleStderrCallback()
+
+	want := []string{"first", "second", "partial"}
+	if strings.Join(received, ",") != strings.Join(want, ",") {
+		t.Fatalf("received %q, want %q", received, want)
 	}
 }
 
@@ -275,10 +376,9 @@ func TestStderrCallbackWithMockCLI(t *testing.T) {
 	}
 
 	// Create a mock CLI that outputs to stderr
-	cliPath := newTransportMockCLIWithStderr()
-	defer func() { _ = os.Remove(cliPath) }()
+	cliPath := newTransportMockCLIWithStderr(t)
 
-	transport := New(cliPath, options, false, "sdk-go")
+	transport := New(cliPath, options, "sdk-go")
 	defer disconnectTransportSafely(t, transport)
 
 	err := transport.Connect(ctx)
@@ -297,31 +397,70 @@ func TestStderrCallbackWithMockCLI(t *testing.T) {
 	}
 }
 
-// newTransportMockCLIWithStderr creates a mock CLI that outputs to stderr
-func newTransportMockCLIWithStderr() string {
-	var script string
-	var extension string
-
-	if runtime.GOOS == windowsOS {
-		extension = testBatExtension
-		script = `@echo off
-if "%1"=="-v" (echo 3.0.0 & exit /b 0)
-echo Stderr line 1 >&2
-echo Stderr line 2 >&2
-echo {"type":"assistant","content":[{"type":"text","text":"Mock response"}],"model":"claude-3"}
-timeout /t 1 /nobreak > NUL
-`
-	} else {
-		extension = ""
-		script = `#!/bin/bash
-# Handle -v flag for version check
-if [ "$1" = "-v" ]; then echo "3.0.0"; exit 0; fi
-echo "Stderr line 1" >&2
-echo "Stderr line 2" >&2
-echo '{"type":"assistant","content":[{"type":"text","text":"Mock response"}],"model":"claude-3"}'
-sleep 0.5
-`
+// TestTransportMaxBufferSizeBoundary ports Python test_subprocess_buffering:
+// a line of exactly the limit passes, and a longer line fails with a
+// *JSONDecodeError that names the limit (Python uses ">", not ">=").
+func TestTransportMaxBufferSizeBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		limit   int
+		wantErr bool
+	}{
+		{"line_equal_to_limit_passes", mockFixedLineLen, false},
+		{"line_over_limit_fails", mockFixedLineLen - 1, true},
 	}
 
-	return createTransportTempScript(script, extension)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+			defer cancel()
+
+			limit := test.limit
+			transport := New(newTransportMockCLIMode(t, mockModeFixedSizeLine), &shared.Options{MaxBufferSize: &limit}, "sdk-go")
+			t.Cleanup(func() { _ = transport.Close() })
+			connectTransportSafely(ctx, t, transport)
+
+			msg, err := firstMessageOrError(ctx, t, transport)
+			if !test.wantErr {
+				if err != nil || msg == nil {
+					t.Fatalf("got message %v, error %v; want the fixed-size line", msg, err)
+				}
+				return
+			}
+			var decodeErr *shared.JSONDecodeError
+			if !errors.As(err, &decodeErr) {
+				t.Fatalf("error = %v (%T), message %v; want *JSONDecodeError", err, err, msg)
+			}
+			want := fmt.Sprintf("JSON message exceeded maximum buffer size of %d bytes", limit)
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want substring %q", err.Error(), want)
+			}
+		})
+	}
+}
+
+// firstMessageOrError returns the first message or error from the transport.
+// A closed channel is skipped, because the error and the close can arrive together.
+func firstMessageOrError(ctx context.Context, t *testing.T, transport *Transport) (shared.Message, error) {
+	t.Helper()
+	msgChan, errChan := transport.ReceiveMessages(ctx)
+	for msgChan != nil || errChan != nil {
+		select {
+		case msg, ok := <-msgChan:
+			if !ok {
+				msgChan = nil
+				continue
+			}
+			return msg, nil
+		case err, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				continue
+			}
+			return nil, err
+		case <-ctx.Done():
+			t.Fatal("no message or error before the timeout")
+		}
+	}
+	return nil, nil
 }

@@ -14,7 +14,7 @@ func TestTransportProcessManagement(t *testing.T) {
 
 	// Test 5-second termination sequence
 	t.Run("five_second_termination", func(t *testing.T) {
-		transport := setupTransportForTest(t, newTransportMockCLIWithOptions(WithLongRunning()))
+		transport := setupTransportForTest(t, newTransportMockCLIWithOptions(t, WithLongRunning()))
 		defer disconnectTransportSafely(t, transport)
 
 		connectTransportSafely(ctx, t, transport)
@@ -36,11 +36,7 @@ func TestTransportProcessManagement(t *testing.T) {
 
 	// Test interrupt handling
 	t.Run("interrupt_handling", func(t *testing.T) {
-		if runtime.GOOS == windowsOS {
-			t.Skip("Interrupt not supported on Windows")
-		}
-
-		transport := setupTransportForTest(t, newTransportMockCLI())
+		transport := setupTransportForTest(t, newTransportMockCLI(t))
 		defer disconnectTransportSafely(t, transport)
 
 		connectTransportSafely(ctx, t, transport)
@@ -64,28 +60,11 @@ func TestTransportTerminateProcessPaths(t *testing.T) {
 
 	// Test normal termination
 	t.Run("normal_termination", func(t *testing.T) {
-		transport := setupTransportForTest(t, newTransportMockCLI())
+		transport := setupTransportForTest(t, newTransportMockCLI(t))
 		connectTransportSafely(ctx, t, transport)
 
 		// Close should trigger terminateProcess
 		err := transport.Close()
-		assertNoTransportError(t, err)
-	})
-
-	// Test SIGTERM timeout (force SIGKILL)
-	t.Run("sigterm_timeout_force_kill", func(t *testing.T) {
-		transport := setupTransportForTest(t, newTransportMockCLIWithOptions(WithLongRunning()))
-		connectTransportSafely(ctx, t, transport)
-
-		// This transport ignores SIGTERM for 6 seconds, forcing SIGKILL
-		start := time.Now()
-		err := transport.Close()
-		duration := time.Since(start)
-
-		// Should complete within reasonable time after 5-second timeout
-		if duration > 8*time.Second {
-			t.Errorf("Termination took too long: %v", duration)
-		}
 		assertNoTransportError(t, err)
 	})
 
@@ -94,7 +73,7 @@ func TestTransportTerminateProcessPaths(t *testing.T) {
 		// Create a context that we can cancel
 		shortCtx, shortCancel := context.WithCancel(ctx)
 
-		transport := setupTransportForTest(t, newTransportMockCLI())
+		transport := setupTransportForTest(t, newTransportMockCLI(t))
 
 		// Connect with the cancellable context
 		connectTransportSafely(shortCtx, t, transport)

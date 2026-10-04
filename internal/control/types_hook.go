@@ -1,15 +1,9 @@
 // Package control provides hook types for lifecycle event handling.
-// This file implements 100% feature parity with the Python SDK hooks system.
 package control
 
 import "context"
 
-// =============================================================================
-// Hook Event Types (Python SDK: types.py:163-170)
-// =============================================================================
-
 // HookEvent represents lifecycle events that can trigger hooks.
-// Matches Python SDK's HookEvent Literal type exactly.
 type HookEvent string
 
 const (
@@ -17,6 +11,9 @@ const (
 	HookEventPreToolUse HookEvent = "PreToolUse"
 	// HookEventPostToolUse is triggered after a tool is executed.
 	HookEventPostToolUse HookEvent = "PostToolUse"
+	// HookEventPostToolUseFailure is triggered after a tool execution fails.
+	// Distinct from PostToolUse, which fires on success.
+	HookEventPostToolUseFailure HookEvent = "PostToolUseFailure"
 	// HookEventUserPromptSubmit is triggered when a user submits a prompt.
 	HookEventUserPromptSubmit HookEvent = "UserPromptSubmit"
 	// HookEventStop is triggered when the session is stopping.
@@ -25,14 +22,15 @@ const (
 	HookEventSubagentStop HookEvent = "SubagentStop"
 	// HookEventPreCompact is triggered before context compaction.
 	HookEventPreCompact HookEvent = "PreCompact"
+	// HookEventNotification is triggered when the CLI emits a notification.
+	HookEventNotification HookEvent = "Notification"
+	// HookEventSubagentStart is triggered when a subagent starts.
+	HookEventSubagentStart HookEvent = "SubagentStart"
+	// HookEventPermissionRequest is triggered when a permission is requested.
+	HookEventPermissionRequest HookEvent = "PermissionRequest"
 )
 
-// =============================================================================
-// Hook Input Types (Python SDK: types.py:174-237)
-// =============================================================================
-
 // BaseHookInput contains common fields present across all hook events.
-// Matches Python SDK's BaseHookInput TypedDict.
 type BaseHookInput struct {
 	// SessionID is the unique identifier for the session.
 	SessionID string `json:"session_id"`
@@ -45,7 +43,6 @@ type BaseHookInput struct {
 }
 
 // PreToolUseHookInput is the input for PreToolUse hook events.
-// Matches Python SDK's PreToolUseHookInput TypedDict.
 type PreToolUseHookInput struct {
 	BaseHookInput
 	// HookEventName is always "PreToolUse".
@@ -54,10 +51,11 @@ type PreToolUseHookInput struct {
 	ToolName string `json:"tool_name"`
 	// ToolInput contains the tool's input parameters.
 	ToolInput map[string]any `json:"tool_input"`
+	// ToolUseID identifies the tool invocation.
+	ToolUseID string `json:"tool_use_id"`
 }
 
 // PostToolUseHookInput is the input for PostToolUse hook events.
-// Matches Python SDK's PostToolUseHookInput TypedDict.
 type PostToolUseHookInput struct {
 	BaseHookInput
 	// HookEventName is always "PostToolUse".
@@ -68,10 +66,29 @@ type PostToolUseHookInput struct {
 	ToolInput map[string]any `json:"tool_input"`
 	// ToolResponse contains the tool's output.
 	ToolResponse any `json:"tool_response"`
+	// ToolUseID identifies the tool invocation.
+	ToolUseID string `json:"tool_use_id"`
+}
+
+// PostToolUseFailureHookInput is the input for PostToolUseFailure hook events.
+type PostToolUseFailureHookInput struct {
+	BaseHookInput
+	// HookEventName is always "PostToolUseFailure".
+	HookEventName string `json:"hook_event_name"`
+	// ToolName is the name of the tool that failed.
+	ToolName string `json:"tool_name"`
+	// ToolInput contains the tool's input parameters.
+	ToolInput map[string]any `json:"tool_input"`
+	// ToolUseID identifies the failed tool invocation.
+	ToolUseID string `json:"tool_use_id"`
+	// Error describes the failure.
+	Error string `json:"error"`
+	// IsInterrupt is true when the failure was caused by user interrupt.
+	// Optional; nil means the key was absent from JSON.
+	IsInterrupt *bool `json:"is_interrupt,omitempty"`
 }
 
 // UserPromptSubmitHookInput is the input for UserPromptSubmit hook events.
-// Matches Python SDK's UserPromptSubmitHookInput TypedDict.
 type UserPromptSubmitHookInput struct {
 	BaseHookInput
 	// HookEventName is always "UserPromptSubmit".
@@ -81,7 +98,6 @@ type UserPromptSubmitHookInput struct {
 }
 
 // StopHookInput is the input for Stop hook events.
-// Matches Python SDK's StopHookInput TypedDict.
 type StopHookInput struct {
 	BaseHookInput
 	// HookEventName is always "Stop".
@@ -91,17 +107,21 @@ type StopHookInput struct {
 }
 
 // SubagentStopHookInput is the input for SubagentStop hook events.
-// Matches Python SDK's SubagentStopHookInput TypedDict.
 type SubagentStopHookInput struct {
 	BaseHookInput
 	// HookEventName is always "SubagentStop".
 	HookEventName string `json:"hook_event_name"`
 	// StopHookActive indicates if the stop hook is currently active.
 	StopHookActive bool `json:"stop_hook_active"`
+	// AgentID is the correlation key for the stopping subagent.
+	AgentID string `json:"agent_id"`
+	// AgentTranscriptPath is the path to the subagent's transcript.
+	AgentTranscriptPath string `json:"agent_transcript_path"`
+	// AgentType is the subagent type (e.g. "researcher").
+	AgentType string `json:"agent_type"`
 }
 
 // PreCompactHookInput is the input for PreCompact hook events.
-// Matches Python SDK's PreCompactHookInput TypedDict.
 type PreCompactHookInput struct {
 	BaseHookInput
 	// HookEventName is always "PreCompact".
@@ -112,12 +132,46 @@ type PreCompactHookInput struct {
 	CustomInstructions *string `json:"custom_instructions,omitempty"`
 }
 
-// =============================================================================
-// Hook-Specific Output Types (Python SDK: types.py:241-276)
-// =============================================================================
+// NotificationHookInput is the input for Notification hook events.
+type NotificationHookInput struct {
+	BaseHookInput
+	// HookEventName is always "Notification".
+	HookEventName string `json:"hook_event_name"`
+	// Message is the notification body.
+	Message string `json:"message"`
+	// Title is the optional notification title.
+	// nil means the key was absent from JSON.
+	Title *string `json:"title,omitempty"`
+	// NotificationType classifies the notification (e.g. "permission_request").
+	NotificationType string `json:"notification_type"`
+}
+
+// SubagentStartHookInput is the input for SubagentStart hook events.
+type SubagentStartHookInput struct {
+	BaseHookInput
+	// HookEventName is always "SubagentStart".
+	HookEventName string `json:"hook_event_name"`
+	// AgentID is the correlation key for the starting subagent.
+	AgentID string `json:"agent_id"`
+	// AgentType is the subagent type (e.g. "researcher").
+	AgentType string `json:"agent_type"`
+}
+
+// PermissionRequestHookInput is the input for PermissionRequest hook events.
+type PermissionRequestHookInput struct {
+	BaseHookInput
+	// HookEventName is always "PermissionRequest".
+	HookEventName string `json:"hook_event_name"`
+	// ToolName is the name of the tool requesting permission.
+	ToolName string `json:"tool_name"`
+	// ToolInput contains the tool's input parameters.
+	ToolInput map[string]any `json:"tool_input"`
+	// PermissionSuggestions carries CLI-provided permission suggestions.
+	// nil means the key was absent from JSON.
+	PermissionSuggestions []any `json:"permission_suggestions,omitempty"`
+}
 
 // PreToolUseHookSpecificOutput contains PreToolUse-specific output fields.
-// Matches Python SDK's PreToolUseHookSpecificOutput TypedDict.
 type PreToolUseHookSpecificOutput struct {
 	// HookEventName is always "PreToolUse".
 	HookEventName string `json:"hookEventName"`
@@ -127,19 +181,31 @@ type PreToolUseHookSpecificOutput struct {
 	PermissionDecisionReason *string `json:"permissionDecisionReason,omitempty"`
 	// UpdatedInput contains modified tool input (optional).
 	UpdatedInput map[string]any `json:"updatedInput,omitempty"`
+	// AdditionalContext provides extra context for Claude.
+	AdditionalContext *string `json:"additionalContext,omitempty"`
 }
 
 // PostToolUseHookSpecificOutput contains PostToolUse-specific output fields.
-// Matches Python SDK's PostToolUseHookSpecificOutput TypedDict.
 type PostToolUseHookSpecificOutput struct {
 	// HookEventName is always "PostToolUse".
+	HookEventName string `json:"hookEventName"`
+	// AdditionalContext provides extra context for Claude.
+	AdditionalContext *string `json:"additionalContext,omitempty"`
+	// UpdatedMCPToolOutput allows the hook to replace the tool output
+	// reported back to Claude. Wire tag preserves camelCase (updatedMCPToolOutput).
+	UpdatedMCPToolOutput any `json:"updatedMCPToolOutput,omitempty"`
+}
+
+// PostToolUseFailureHookSpecificOutput contains PostToolUseFailure-specific output fields.
+// Structurally identical to PostToolUseHookSpecificOutput; only the HookEventName literal differs.
+type PostToolUseFailureHookSpecificOutput struct {
+	// HookEventName is always "PostToolUseFailure".
 	HookEventName string `json:"hookEventName"`
 	// AdditionalContext provides extra context for Claude.
 	AdditionalContext *string `json:"additionalContext,omitempty"`
 }
 
 // UserPromptSubmitHookSpecificOutput contains UserPromptSubmit-specific output fields.
-// Matches Python SDK's UserPromptSubmitHookSpecificOutput TypedDict.
 type UserPromptSubmitHookSpecificOutput struct {
 	// HookEventName is always "UserPromptSubmit".
 	HookEventName string `json:"hookEventName"`
@@ -147,16 +213,34 @@ type UserPromptSubmitHookSpecificOutput struct {
 	AdditionalContext *string `json:"additionalContext,omitempty"`
 }
 
-// =============================================================================
-// Hook Output Types (Python SDK: types.py:286-345)
-// =============================================================================
+// NotificationHookSpecificOutput contains Notification-specific output fields.
+type NotificationHookSpecificOutput struct {
+	// HookEventName is always "Notification".
+	HookEventName string `json:"hookEventName"`
+	// AdditionalContext provides extra context for Claude.
+	AdditionalContext *string `json:"additionalContext,omitempty"`
+}
+
+// SubagentStartHookSpecificOutput contains SubagentStart-specific output fields.
+type SubagentStartHookSpecificOutput struct {
+	// HookEventName is always "SubagentStart".
+	HookEventName string `json:"hookEventName"`
+	// AdditionalContext provides extra context for Claude.
+	AdditionalContext *string `json:"additionalContext,omitempty"`
+}
+
+// PermissionRequestHookSpecificOutput contains PermissionRequest-specific output fields.
+// Decision is required (not omitempty).
+type PermissionRequestHookSpecificOutput struct {
+	// HookEventName is always "PermissionRequest".
+	HookEventName string `json:"hookEventName"`
+	// Decision conveys the permission decision back to the CLI.
+	Decision map[string]any `json:"decision"`
+}
 
 // HookJSONOutput is the synchronous hook output structure.
-// Matches Python SDK's SyncHookJSONOutput TypedDict.
-// Note: Go can use "continue" and "async" directly (not keywords like in Python).
 type HookJSONOutput struct {
 	// Continue indicates whether Claude should proceed (default: true).
-	// Python SDK uses continue_ to avoid keyword conflict.
 	Continue *bool `json:"continue,omitempty"`
 	// SuppressOutput hides stdout from transcript mode.
 	SuppressOutput *bool `json:"suppressOutput,omitempty"`
@@ -175,34 +259,21 @@ type HookJSONOutput struct {
 }
 
 // AsyncHookJSONOutput indicates the hook will respond asynchronously.
-// Matches Python SDK's AsyncHookJSONOutput TypedDict.
 type AsyncHookJSONOutput struct {
 	// Async must be true for async hook output.
-	// Python SDK uses async_ to avoid keyword conflict.
 	Async bool `json:"async"`
 	// AsyncTimeout is the timeout in milliseconds for the async operation.
 	AsyncTimeout int `json:"asyncTimeout,omitempty"`
 }
 
-// =============================================================================
-// Hook Context (Python SDK: types.py:348-355)
-// =============================================================================
-
 // HookContext provides context information for hook callbacks.
-// Matches Python SDK's HookContext TypedDict.
 type HookContext struct {
 	// Signal is reserved for future abort signal support.
 	// Currently always holds the parent context for cancellation.
 	Signal context.Context `json:"-"`
 }
 
-// =============================================================================
-// Hook Callback Type (Python SDK: types.py:358-365)
-// =============================================================================
-
 // HookCallback is the function signature for hook callbacks.
-// Go idiom: context.Context as first parameter, (result, error) return.
-// Python SDK uses async callback; Go uses synchronous with context for cancellation.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeouts
@@ -220,15 +291,10 @@ type HookCallback func(
 	hookCtx HookContext,
 ) (HookJSONOutput, error)
 
-// =============================================================================
-// Hook Matcher (Python SDK: types.py:369-383)
-// =============================================================================
-
 // HookMatcher defines which hooks to trigger for a given pattern.
-// Matches Python SDK's HookMatcher dataclass.
 type HookMatcher struct {
 	// Matcher is a tool name pattern (e.g., "Bash", "Write|Edit|MultiEdit").
-	// Empty string matches all tools (Python SDK: None).
+	// Empty string matches all tools.
 	Matcher string `json:"matcher"`
 
 	// Hooks are the callbacks to execute when the pattern matches.
@@ -236,13 +302,9 @@ type HookMatcher struct {
 	Hooks []HookCallback `json:"-"`
 
 	// Timeout is the maximum time in seconds for all hooks in this matcher.
-	// Default is 60 seconds (Python SDK default).
+	// Default is 60 seconds.
 	Timeout *float64 `json:"timeout,omitempty"`
 }
-
-// =============================================================================
-// Hook Registration Types (for initialize request)
-// =============================================================================
 
 // HookMatcherConfig is the serializable format for the initialize request.
 // This is what gets sent to the CLI during initialization.

@@ -12,11 +12,8 @@ import (
 // Test constants for hook callback tests.
 const (
 	testDecisionBlock = "block"
+	testToolNameBash  = "Bash"
 )
-
-// =============================================================================
-// Hook Callback Handler Tests
-// =============================================================================
 
 func TestHookCallbackHandler_PreToolUse(t *testing.T) {
 	ctx, cancel := setupHookTestContext(t, 5*time.Second)
@@ -68,8 +65,9 @@ func TestHookCallbackHandler_PreToolUse(t *testing.T) {
 				"cwd":             "/home/user",
 				"permission_mode": "default",
 				"hook_event_name": "PreToolUse",
-				"tool_name":       "Bash",
+				"tool_name":       testToolNameBash,
 				"tool_input":      map[string]any{"command": "ls -la"},
+				"tool_use_id":     "tool_use_inner",
 			},
 			"tool_use_id": toolUseID,
 		},
@@ -88,8 +86,12 @@ func TestHookCallbackHandler_PreToolUse(t *testing.T) {
 		t.Fatalf("Expected *PreToolUseHookInput, got %T", receivedInput)
 	}
 
-	if preToolInput.ToolName != "Bash" {
-		t.Errorf("ToolName = %q, want %q", preToolInput.ToolName, "Bash")
+	if preToolInput.ToolName != testToolNameBash {
+		t.Errorf("ToolName = %q, want %q", preToolInput.ToolName, testToolNameBash)
+	}
+
+	if preToolInput.ToolUseID != "tool_use_inner" {
+		t.Errorf("ToolUseID = %q, want %q", preToolInput.ToolUseID, "tool_use_inner")
 	}
 
 	if receivedToolUseID == nil || *receivedToolUseID != toolUseID {
@@ -142,9 +144,10 @@ func TestHookCallbackHandler_PostToolUse(t *testing.T) {
 				"transcript_path": "/tmp/transcript.json",
 				"cwd":             "/home/user",
 				"hook_event_name": "PostToolUse",
-				"tool_name":       "Bash",
+				"tool_name":       testToolNameBash,
 				"tool_input":      map[string]any{"command": "ls -la"},
 				"tool_response":   "file1.txt\nfile2.txt",
+				"tool_use_id":     "tool_use_inner",
 			},
 		},
 	}
@@ -163,6 +166,162 @@ func TestHookCallbackHandler_PostToolUse(t *testing.T) {
 
 	if postToolInput.ToolResponse != "file1.txt\nfile2.txt" {
 		t.Errorf("ToolResponse = %v, want %q", postToolInput.ToolResponse, "file1.txt\nfile2.txt")
+	}
+
+	if postToolInput.ToolUseID != "tool_use_inner" {
+		t.Errorf("ToolUseID = %q, want %q", postToolInput.ToolUseID, "tool_use_inner")
+	}
+}
+
+func TestHookCallbackHandler_PostToolUseFailure(t *testing.T) {
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callbackCalled := false
+
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		callbackCalled = true
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{
+		"hook_0": callback,
+	}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_ptuf",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "PostToolUseFailure",
+			"input": map[string]any{
+				"session_id":      "test-session",
+				"transcript_path": "/tmp/transcript.json",
+				"cwd":             "/home/user",
+				"hook_event_name": "PostToolUseFailure",
+				"tool_name":       testToolNameBash,
+				"tool_input":      map[string]any{"command": "ls -la"},
+				"tool_use_id":     "tool_use_abc",
+				"error":           "exit status 1",
+				"is_interrupt":    true,
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	if !callbackCalled {
+		t.Fatal("Expected callback to be called")
+	}
+
+	failureInput, ok := receivedInput.(*PostToolUseFailureHookInput)
+	if !ok {
+		t.Fatalf("Expected *PostToolUseFailureHookInput, got %T", receivedInput)
+		return
+	}
+
+	if failureInput.HookEventName != "PostToolUseFailure" {
+		t.Errorf("HookEventName = %q, want %q", failureInput.HookEventName, "PostToolUseFailure")
+	}
+	if failureInput.ToolName != testToolNameBash {
+		t.Errorf("ToolName = %q, want %q", failureInput.ToolName, testToolNameBash)
+	}
+	if failureInput.ToolUseID != "tool_use_abc" {
+		t.Errorf("ToolUseID = %q, want %q", failureInput.ToolUseID, "tool_use_abc")
+	}
+	if failureInput.Error != "exit status 1" {
+		t.Errorf("Error = %q, want %q", failureInput.Error, "exit status 1")
+	}
+	if failureInput.IsInterrupt == nil || !*failureInput.IsInterrupt {
+		t.Errorf("IsInterrupt = %v, want pointer to true", failureInput.IsInterrupt)
+	}
+	if failureInput.ToolInput["command"] != "ls -la" {
+		t.Errorf("ToolInput[command] = %v, want %q", failureInput.ToolInput["command"], "ls -la")
+	}
+	// Base hook fields propagated
+	if failureInput.SessionID != "test-session" {
+		t.Errorf("SessionID = %q, want %q", failureInput.SessionID, "test-session")
+	}
+}
+
+func TestHookCallbackHandler_PostToolUseFailureNoInterrupt(t *testing.T) {
+	// Verifies that when the input map omits "is_interrupt", the parsed struct's
+	// IsInterrupt is nil (Python's NotRequired[bool] semantics).
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{
+		"hook_0": callback,
+	}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_ptuf_nointr",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "PostToolUseFailure",
+			"input": map[string]any{
+				"session_id":      "test-session",
+				"transcript_path": "/tmp/transcript.json",
+				"cwd":             "/home/user",
+				"hook_event_name": "PostToolUseFailure",
+				"tool_name":       testToolNameBash,
+				"tool_input":      map[string]any{"command": "ls"},
+				"tool_use_id":     "tool_use_abc",
+				"error":           "boom",
+				// is_interrupt deliberately omitted
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	failureInput, ok := receivedInput.(*PostToolUseFailureHookInput)
+	if !ok {
+		t.Fatalf("Expected *PostToolUseFailureHookInput, got %T", receivedInput)
+		return
+	}
+
+	if failureInput.IsInterrupt != nil {
+		t.Errorf("IsInterrupt = %v, want nil when key absent", *failureInput.IsInterrupt)
 	}
 }
 
@@ -208,7 +367,7 @@ func TestHookCallbackHandler_BlockDecision(t *testing.T) {
 				"transcript_path": "/tmp/transcript.json",
 				"cwd":             "/home/user",
 				"hook_event_name": "PreToolUse",
-				"tool_name":       "Bash",
+				"tool_name":       testToolNameBash,
 				"tool_input":      map[string]any{"command": "rm -rf /"},
 			},
 		},
@@ -279,7 +438,7 @@ func TestHookCallbackHandler_PanicRecovery(t *testing.T) {
 				"transcript_path": "/tmp/transcript.json",
 				"cwd":             "/home/user",
 				"hook_event_name": "PreToolUse",
-				"tool_name":       "Bash",
+				"tool_name":       testToolNameBash,
 				"tool_input":      map[string]any{"command": "ls"},
 			},
 		},
@@ -320,7 +479,7 @@ func TestHookCallbackHandler_NotFound(t *testing.T) {
 				"transcript_path": "/tmp/transcript.json",
 				"cwd":             "/home/user",
 				"hook_event_name": "PreToolUse",
-				"tool_name":       "Bash",
+				"tool_name":       testToolNameBash,
 				"tool_input":      map[string]any{"command": "ls"},
 			},
 		},
@@ -370,7 +529,7 @@ func TestHookCallbackHandler_CallbackError(t *testing.T) {
 				"transcript_path": "/tmp/transcript.json",
 				"cwd":             "/home/user",
 				"hook_event_name": "PreToolUse",
-				"tool_name":       "Bash",
+				"tool_name":       testToolNameBash,
 				"tool_input":      map[string]any{"command": "ls"},
 			},
 		},
@@ -511,6 +670,421 @@ func TestHookCallbackHandler_StopHook(t *testing.T) {
 	}
 }
 
+func TestHookCallbackHandler_SubagentStop(t *testing.T) {
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callbackCalled := false
+
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		callbackCalled = true
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{
+		"hook_0": callback,
+	}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_subagentstop",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "SubagentStop",
+			"input": map[string]any{
+				"session_id":            "test-session",
+				"transcript_path":       "/tmp/transcript.json",
+				"cwd":                   "/home/user",
+				"hook_event_name":       "SubagentStop",
+				"stop_hook_active":      true,
+				"agent_id":              "agent_xyz",
+				"agent_transcript_path": "/tmp/agent_transcript.json",
+				"agent_type":            "researcher",
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	if !callbackCalled {
+		t.Fatal("Expected callback to be called")
+	}
+
+	stopInput, ok := receivedInput.(*SubagentStopHookInput)
+	if !ok {
+		t.Fatalf("Expected *SubagentStopHookInput, got %T", receivedInput)
+		return
+	}
+
+	if !stopInput.StopHookActive {
+		t.Error("StopHookActive should be true")
+	}
+	if stopInput.AgentID != "agent_xyz" {
+		t.Errorf("AgentID = %q, want %q", stopInput.AgentID, "agent_xyz")
+	}
+	if stopInput.AgentTranscriptPath != "/tmp/agent_transcript.json" {
+		t.Errorf("AgentTranscriptPath = %q, want %q", stopInput.AgentTranscriptPath, "/tmp/agent_transcript.json")
+	}
+	if stopInput.AgentType != "researcher" {
+		t.Errorf("AgentType = %q, want %q", stopInput.AgentType, "researcher")
+	}
+}
+
+func TestHookCallbackHandler_Notification(t *testing.T) {
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callbackCalled := false
+
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		callbackCalled = true
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{
+		"hook_0": callback,
+	}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_notification",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "Notification",
+			"input": map[string]any{
+				"session_id":        "test-session",
+				"transcript_path":   "/tmp/transcript.json",
+				"cwd":               "/home/user",
+				"hook_event_name":   "Notification",
+				"message":           "Permission requested",
+				"title":             "Tool Approval",
+				"notification_type": "permission_request",
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	if !callbackCalled {
+		t.Fatal("Expected callback to be called")
+	}
+
+	notifInput, ok := receivedInput.(*NotificationHookInput)
+	if !ok {
+		t.Fatalf("Expected *NotificationHookInput, got %T", receivedInput)
+		return
+	}
+
+	if notifInput.HookEventName != "Notification" {
+		t.Errorf("HookEventName = %q, want %q", notifInput.HookEventName, "Notification")
+	}
+	if notifInput.Message != "Permission requested" {
+		t.Errorf("Message = %q, want %q", notifInput.Message, "Permission requested")
+	}
+	if notifInput.Title == nil || *notifInput.Title != "Tool Approval" {
+		t.Errorf("Title = %v, want pointer to %q", notifInput.Title, "Tool Approval")
+	}
+	if notifInput.NotificationType != "permission_request" {
+		t.Errorf("NotificationType = %q, want %q", notifInput.NotificationType, "permission_request")
+	}
+}
+
+func TestHookCallbackHandler_NotificationNoTitle(t *testing.T) {
+	// Verifies title key absent in JSON parses to nil pointer.
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{"hook_0": callback}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_notif_notitle",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "Notification",
+			"input": map[string]any{
+				"session_id":        "test-session",
+				"transcript_path":   "/tmp/transcript.json",
+				"cwd":               "/home/user",
+				"hook_event_name":   "Notification",
+				"message":           "Heartbeat",
+				"notification_type": "info",
+				// title deliberately omitted
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	notifInput, ok := receivedInput.(*NotificationHookInput)
+	if !ok {
+		t.Fatalf("Expected *NotificationHookInput, got %T", receivedInput)
+		return
+	}
+	if notifInput.Title != nil {
+		t.Errorf("Title = %v, want nil when key absent", *notifInput.Title)
+	}
+}
+
+func TestHookCallbackHandler_SubagentStart(t *testing.T) {
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callbackCalled := false
+
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		callbackCalled = true
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{
+		"hook_0": callback,
+	}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_subagent_start",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "SubagentStart",
+			"input": map[string]any{
+				"session_id":      "test-session",
+				"transcript_path": "/tmp/transcript.json",
+				"cwd":             "/home/user",
+				"hook_event_name": "SubagentStart",
+				"agent_id":        "agent_xyz",
+				"agent_type":      "researcher",
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	if !callbackCalled {
+		t.Fatal("Expected callback to be called")
+	}
+
+	startInput, ok := receivedInput.(*SubagentStartHookInput)
+	if !ok {
+		t.Fatalf("Expected *SubagentStartHookInput, got %T", receivedInput)
+		return
+	}
+
+	if startInput.AgentID != "agent_xyz" {
+		t.Errorf("AgentID = %q, want %q", startInput.AgentID, "agent_xyz")
+	}
+	if startInput.AgentType != "researcher" {
+		t.Errorf("AgentType = %q, want %q", startInput.AgentType, "researcher")
+	}
+}
+
+func TestHookCallbackHandler_PermissionRequest(t *testing.T) {
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callbackCalled := false
+
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		callbackCalled = true
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{
+		"hook_0": callback,
+	}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_permreq",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "PermissionRequest",
+			"input": map[string]any{
+				"session_id":      "test-session",
+				"transcript_path": "/tmp/transcript.json",
+				"cwd":             "/home/user",
+				"hook_event_name": "PermissionRequest",
+				"tool_name":       testToolNameBash,
+				"tool_input":      map[string]any{"command": "rm -rf foo"},
+				"permission_suggestions": []any{
+					map[string]any{
+						"type":  "addRules",
+						"rules": []any{"Bash(ls:*)"},
+					},
+				},
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	if !callbackCalled {
+		t.Fatal("Expected callback to be called")
+	}
+
+	permInput, ok := receivedInput.(*PermissionRequestHookInput)
+	if !ok {
+		t.Fatalf("Expected *PermissionRequestHookInput, got %T", receivedInput)
+		return
+	}
+
+	if permInput.ToolName != testToolNameBash {
+		t.Errorf("ToolName = %q, want %q", permInput.ToolName, testToolNameBash)
+	}
+	if permInput.ToolInput["command"] != "rm -rf foo" {
+		t.Errorf("ToolInput[command] = %v, want %q", permInput.ToolInput["command"], "rm -rf foo")
+	}
+	if len(permInput.PermissionSuggestions) != 1 {
+		t.Errorf("PermissionSuggestions length = %d, want 1", len(permInput.PermissionSuggestions))
+	}
+}
+
+func TestHookCallbackHandler_PermissionRequestNoSuggestions(t *testing.T) {
+	// Verifies permission_suggestions absent yields nil slice.
+	ctx, cancel := setupHookTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newHookMockTransport()
+
+	var receivedInput any
+	callback := func(
+		_ context.Context,
+		input any,
+		_ *string,
+		_ HookContext,
+	) (HookJSONOutput, error) {
+		receivedInput = input
+		return HookJSONOutput{}, nil
+	}
+
+	hookCallbacks := map[string]HookCallback{"hook_0": callback}
+
+	protocol := NewProtocol(transport, WithHookCallbacks(hookCallbacks))
+	err := protocol.Start(ctx)
+	assertHookNoError(t, err)
+	defer func() { _ = protocol.Close() }()
+
+	request := map[string]any{
+		"type":       MessageTypeControlRequest,
+		"request_id": "req_hook_permreq_nosug",
+		"request": map[string]any{
+			"subtype":         SubtypeHookCallback,
+			"callback_id":     "hook_0",
+			"hook_event_name": "PermissionRequest",
+			"input": map[string]any{
+				"session_id":      "test-session",
+				"transcript_path": "/tmp/transcript.json",
+				"cwd":             "/home/user",
+				"hook_event_name": "PermissionRequest",
+				"tool_name":       testToolNameBash,
+				"tool_input":      map[string]any{"command": "ls"},
+				// permission_suggestions omitted
+			},
+		},
+	}
+
+	err = protocol.HandleIncomingMessage(ctx, request)
+	assertHookNoError(t, err)
+
+	permInput, ok := receivedInput.(*PermissionRequestHookInput)
+	if !ok {
+		t.Fatalf("Expected *PermissionRequestHookInput, got %T", receivedInput)
+		return
+	}
+
+	if permInput.PermissionSuggestions != nil {
+		t.Errorf("PermissionSuggestions = %v, want nil when key absent", permInput.PermissionSuggestions)
+	}
+}
+
 func TestHookCallbackHandler_ThreadSafe(t *testing.T) {
 	ctx, cancel := setupHookTestContext(t, 10*time.Second)
 	defer cancel()
@@ -562,7 +1136,7 @@ func TestHookCallbackHandler_ThreadSafe(t *testing.T) {
 						"transcript_path": "/tmp/transcript.json",
 						"cwd":             "/home/user",
 						"hook_event_name": "PreToolUse",
-						"tool_name":       "Bash",
+						"tool_name":       testToolNameBash,
 						"tool_input":      map[string]any{"command": "ls"},
 					},
 				},
@@ -580,10 +1154,6 @@ func TestHookCallbackHandler_ThreadSafe(t *testing.T) {
 	mu.Unlock()
 }
 
-// =============================================================================
-// Initialize with Hooks Tests
-// =============================================================================
-
 func TestGenerateHookRegistrations(t *testing.T) {
 	callback := func(
 		_ context.Context,
@@ -596,7 +1166,7 @@ func TestGenerateHookRegistrations(t *testing.T) {
 
 	hooks := map[HookEvent][]HookMatcher{
 		HookEventPreToolUse: {
-			{Matcher: "Bash", Hooks: []HookCallback{callback}},
+			{Matcher: testToolNameBash, Hooks: []HookCallback{callback}},
 			{Matcher: "Write|Edit", Hooks: []HookCallback{callback, callback}},
 		},
 		HookEventPostToolUse: {
@@ -645,7 +1215,7 @@ func TestInitializeWithHooks(t *testing.T) {
 	timeout := 30.0
 	hooks := map[HookEvent][]HookMatcher{
 		HookEventPreToolUse: {
-			{Matcher: "Bash", Hooks: []HookCallback{callback}, Timeout: &timeout},
+			{Matcher: testToolNameBash, Hooks: []HookCallback{callback}, Timeout: &timeout},
 		},
 	}
 
@@ -708,10 +1278,6 @@ func TestInitializeWithHooks(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Mock Transport for Hook Tests
-// =============================================================================
-
 type hookMockTransport struct {
 	mu          sync.Mutex
 	writtenData [][]byte
@@ -769,10 +1335,6 @@ func (t *hookMockTransport) injectResponse(requestID string, response map[string
 	data, _ := json.Marshal(resp)
 	t.readChan <- data
 }
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
 
 func setupHookTestContext(t *testing.T, timeout time.Duration) (context.Context, context.CancelFunc) {
 	t.Helper()

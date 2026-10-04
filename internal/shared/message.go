@@ -17,6 +17,13 @@ const (
 
 	// Partial message streaming type
 	MessageTypeStreamEvent = "stream_event"
+
+	// Session heartbeat carrying rate-limit window state. Emitted on
+	// essentially every CLI session — even when nothing is constrained.
+	MessageTypeRateLimitEvent = "rate_limit_event"
+
+	// Conversation replaced mid-session, for example after /clear.
+	MessageTypeConversationReset = "conversation_reset"
 )
 
 // Content block type constants
@@ -25,6 +32,25 @@ const (
 	ContentBlockTypeThinking   = "thinking"
 	ContentBlockTypeToolUse    = "tool_use"
 	ContentBlockTypeToolResult = "tool_result"
+
+	// Blocks for tools that the API runs on the server side.
+	ContentBlockTypeServerToolUse     = "server_tool_use"
+	ContentBlockTypeAdvisorToolResult = "advisor_tool_result"
+)
+
+// ServerToolName names a tool that the API runs on the server side.
+type ServerToolName string
+
+// ServerToolName values. The CLI can send other names; they pass through.
+const (
+	ServerToolNameAdvisor                 ServerToolName = "advisor"
+	ServerToolNameWebSearch               ServerToolName = "web_search"
+	ServerToolNameWebFetch                ServerToolName = "web_fetch"
+	ServerToolNameCodeExecution           ServerToolName = "code_execution"
+	ServerToolNameBashCodeExecution       ServerToolName = "bash_code_execution"
+	ServerToolNameTextEditorCodeExecution ServerToolName = "text_editor_code_execution"
+	ServerToolNameToolSearchToolRegex     ServerToolName = "tool_search_tool_regex"
+	ServerToolNameToolSearchToolBM25      ServerToolName = "tool_search_tool_bm25"
 )
 
 // AssistantMessageError represents error types in assistant messages.
@@ -105,15 +131,34 @@ func (m *UserMessage) MarshalJSON() ([]byte, error) {
 
 // AssistantMessage represents a message from the assistant.
 type AssistantMessage struct {
-	MessageType string                 `json:"type"`
-	Content     []ContentBlock         `json:"content"`
-	Model       string                 `json:"model"`
-	Error       *AssistantMessageError `json:"error,omitempty"`
+	MessageType     string                 `json:"type"`
+	Content         []ContentBlock         `json:"content"`
+	Model           string                 `json:"model"`
+	Error           *AssistantMessageError `json:"error,omitempty"`
+	ParentToolUseID *string                `json:"parent_tool_use_id,omitempty"`
+	// Usage carries the token usage for this single API round-trip (input_tokens,
+	// output_tokens, cache_creation_input_tokens, cache_read_input_tokens, ...),
+	// not a running or turn-level total. The CLI does not currently expose a
+	// message ID on this event, and a single API response can be split across
+	// multiple AssistantMessage events that report identical Usage - so summing
+	// Usage across consecutive AssistantMessages double-counts. Nil when the CLI
+	// omits the field (e.g. synthetic messages).
+	Usage *map[string]any `json:"usage,omitempty"`
 }
 
 // Type returns the message type for AssistantMessage.
 func (m *AssistantMessage) Type() string {
 	return MessageTypeAssistant
+}
+
+// GetParentToolUseID returns the parent tool use ID or empty string if nil.
+// On assistant messages produced inside a subagent (Agent/Task tool), this
+// identifies the orchestrator tool_use_id that spawned the subagent.
+func (m *AssistantMessage) GetParentToolUseID() string {
+	if m.ParentToolUseID != nil {
+		return *m.ParentToolUseID
+	}
+	return ""
 }
 
 // HasError returns true if the message contains an error.
@@ -177,6 +222,7 @@ type ResultMessage struct {
 	DurationMs       int             `json:"duration_ms"`
 	DurationAPIMs    int             `json:"duration_api_ms"`
 	IsError          bool            `json:"is_error"`
+	Errors           []string        `json:"errors,omitempty"`
 	NumTurns         int             `json:"num_turns"`
 	SessionID        string          `json:"session_id"`
 	TotalCostUSD     *float64        `json:"total_cost_usd,omitempty"`
@@ -252,6 +298,33 @@ func (b *ToolResultBlock) BlockType() string {
 	return ContentBlockTypeToolResult
 }
 
+// ServerToolUseBlock is a call to a tool that the API runs on the server
+// side, such as advisor or web_search. The caller sends no result for it.
+type ServerToolUseBlock struct {
+	MessageType string         `json:"type"`
+	ID          string         `json:"id"`
+	Name        ServerToolName `json:"name"`
+	Input       map[string]any `json:"input"`
+}
+
+// BlockType returns the content block type for ServerToolUseBlock.
+func (b *ServerToolUseBlock) BlockType() string {
+	return ContentBlockTypeServerToolUse
+}
+
+// ServerToolResultBlock is the result of a server-side tool call. Content is
+// the raw object from the API; its "type" key names the result schema.
+type ServerToolResultBlock struct {
+	MessageType string         `json:"type"`
+	ToolUseID   string         `json:"tool_use_id"`
+	Content     map[string]any `json:"content"`
+}
+
+// BlockType returns the content block type for ServerToolResultBlock.
+func (b *ServerToolResultBlock) BlockType() string {
+	return ContentBlockTypeAdvisorToolResult
+}
+
 // RawControlMessage wraps raw control protocol messages for passthrough to the control handler.
 // Control messages are not parsed into typed structs by the parser - they are routed directly
 // to the control protocol handler which performs its own parsing.
@@ -263,6 +336,68 @@ type RawControlMessage struct {
 // Type returns the message type for RawControlMessage.
 func (m *RawControlMessage) Type() string {
 	return m.MessageType
+}
+
+// Rate-limit window status constants. Status carries one of these strings;
+// "allowed" means the session is fine and the message is informational only.
+const (
+	RateLimitStatusAllowed = "allowed"
+)
+
+// RateLimitInfo carries the rate-limit window state from a rate_limit_event
+// message. The Claude CLI emits one of these as a per-session heartbeat
+// regardless of whether the user is actually constrained — check Status to
+// decide if action is needed.
+type RateLimitInfo struct {
+	Status          string `json:"status"`
+	ResetsAt        int64  `json:"resetsAt"`
+	RateLimitType   string `json:"rateLimitType"`
+	OverageStatus   string `json:"overageStatus,omitempty"`
+	OverageResetsAt int64  `json:"overageResetsAt,omitempty"`
+	IsUsingOverage  bool   `json:"isUsingOverage,omitempty"`
+}
+
+// RateLimitEventMessage is a session heartbeat from the CLI announcing the
+// current rate-limit window. Emitted on essentially every session even when
+// nothing is constrained — most consumers can simply ignore the message
+// unless RateLimitInfo.Status differs from RateLimitStatusAllowed.
+//
+// See https://github.com/severity1/claude-agent-sdk-go/issues/126.
+type RateLimitEventMessage struct {
+	MessageType   string        `json:"type"`
+	RateLimitInfo RateLimitInfo `json:"rate_limit_info"`
+	UUID          string        `json:"uuid,omitempty"`
+	SessionID     string        `json:"session_id,omitempty"`
+}
+
+// Type returns the message type for RateLimitEventMessage.
+func (m *RateLimitEventMessage) Type() string {
+	return MessageTypeRateLimitEvent
+}
+
+// ConversationResetMessage reports that the session's conversation was
+// replaced without ending the connection, for example after /clear. Later
+// ResultMessage totals such as TotalCostUSD start again from zero, and later
+// messages carry a new session ID.
+type ConversationResetMessage struct {
+	MessageType string `json:"type"`
+	// NewConversationID identifies the new conversation. It is not the
+	// session ID of later messages.
+	NewConversationID string `json:"new_conversation_id"`
+	UUID              string `json:"uuid"`
+	// SessionID is the ID of the session that was reset.
+	SessionID string `json:"session_id"`
+}
+
+// Type returns the message type for ConversationResetMessage.
+func (m *ConversationResetMessage) Type() string {
+	return MessageTypeConversationReset
+}
+
+// IsAllowed returns true when the rate-limit window is healthy — i.e. the
+// heartbeat is informational and the consumer can keep going.
+func (m *RateLimitEventMessage) IsAllowed() bool {
+	return m.RateLimitInfo.Status == RateLimitStatusAllowed
 }
 
 // Stream event type constants for Event["type"] discrimination.

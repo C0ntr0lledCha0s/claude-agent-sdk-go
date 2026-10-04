@@ -36,14 +36,16 @@ func TestStreamMessageJSON(t *testing.T) {
 			},
 		},
 		{
-			name: "minimal_message_omitempty",
+			name: "minimal_message_always_emits_session_and_parent",
 			msg: &StreamMessage{
 				Type: "user",
-				// All other fields nil/empty - should be omitted due to omitempty
+				// session_id and parent_tool_use_id are emitted even when
+				// empty/nil so the wire shape matches the Python/TS SDKs.
 			},
 			expected: map[string]any{
-				"type": "user",
-				// No other fields should be present
+				"type":               "user",
+				"session_id":         "",
+				"parent_tool_use_id": nil,
 			},
 		},
 	}
@@ -72,8 +74,6 @@ func (m *mockIterator) Next(_ context.Context) (Message, error) {
 func (m *mockIterator) Close() error {
 	return nil
 }
-
-// Helper functions following established patterns
 
 // assertStreamMessageJSON verifies JSON marshaling behavior
 func assertStreamMessageJSON(t *testing.T, msg *StreamMessage, expected map[string]any) {

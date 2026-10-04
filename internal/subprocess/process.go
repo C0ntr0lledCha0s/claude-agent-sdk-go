@@ -17,69 +17,81 @@ func isProcessAlreadyFinishedError(err error) bool {
 	return strings.Contains(errStr, "process already finished") ||
 		strings.Contains(errStr, "process already released") ||
 		strings.Contains(errStr, "no child processes") ||
-		strings.Contains(errStr, "signal: killed")
+		strings.Contains(errStr, "signal: killed") ||
+		// Windows returns this when TerminateProcess targets an already-exited process.
+		strings.Contains(errStr, "TerminateProcess: Access is denied")
 }
 
-// terminateProcess implements the 5-second SIGTERM -> SIGKILL sequence
+// startProcessWaiter makes one goroutine the sole cmd.Wait caller. Go's
+// exec.Cmd forbids a second Wait, so other code waits on processDone instead
+// (the Go equivalent of Python's idempotent process.wait()).
+func (t *Transport) startProcessWaiter() {
+	exit := &processExit{done: make(chan struct{})}
+	cmd := t.cmd
+	t.processDone = exit.done
+	t.exitMu.Lock()
+	t.exit = exit
+	t.exitMu.Unlock()
+	go func() {
+		waitErr := cmd.Wait()
+		exit.err = exitReason(cmd.ProcessState, waitErr)
+		close(exit.done)
+	}()
+}
+
+// processExit records the exit of one CLI process. err is written once,
+// before done closes, so readers that saw done closed need no lock.
+type processExit struct {
+	done chan struct{}
+	err  error
+}
+
+// terminateProcess runs after stdin is closed (Python close()): wait 5s for
+// a clean exit, SIGTERM, wait 5s, SIGKILL, wait 5s. It uses fixed timers and
+// no ctx, so a cancelled caller still gets every step. It never calls
+// cmd.Wait; startProcessWaiter owns that call. On Windows SIGTERM fails and
+// the sequence goes to Kill (Python: terminate() is TerminateProcess there).
 func (t *Transport) terminateProcess() error {
-	if t.cmd == nil || t.cmd.Process == nil {
+	if t.cmd == nil || t.cmd.Process == nil || t.processDone == nil {
 		return nil
 	}
 
-	// Send SIGTERM
-	if err := t.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		// If process is already finished, that's success
-		if isProcessAlreadyFinishedError(err) {
+	// stdout EOF alone is not proof of exit; only processDone is.
+	if t.waitProcessDone(terminationTimeoutSeconds * time.Second) {
+		return nil
+	}
+
+	err := t.cmd.Process.Signal(syscall.SIGTERM)
+	if err == nil || isProcessAlreadyFinishedError(err) {
+		if t.waitProcessDone(terminationTimeoutSeconds * time.Second) {
 			return nil
 		}
-		// If SIGTERM fails for other reasons, try SIGKILL immediately
-		killErr := t.cmd.Process.Kill()
-		if killErr != nil && !isProcessAlreadyFinishedError(killErr) {
-			return killErr
-		}
-		return nil // Don't return error for expected termination
 	}
 
-	// Wait exactly 5 seconds
-	done := make(chan error, 1)
-	// Capture cmd while we know it's valid to avoid data race
-	cmd := t.cmd
-	go func() {
-		done <- cmd.Wait()
-	}()
+	if killErr := t.cmd.Process.Kill(); killErr != nil && !isProcessAlreadyFinishedError(killErr) {
+		return killErr
+	}
+	// Bounded: startProcessWaiter still reaps the process if this times out.
+	t.waitProcessDone(terminationTimeoutSeconds * time.Second)
+	return nil
+}
 
+// waitProcessDone waits up to d for the process to exit and reports whether it did.
+func (t *Transport) waitProcessDone(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
-	case err := <-done:
-		// Normal termination or expected signals are not errors
-		if err != nil {
-			// Check if it's an expected exit signal
-			if strings.Contains(err.Error(), "signal:") {
-				return nil // Expected signal termination
-			}
-		}
-		return err
-	case <-time.After(terminationTimeoutSeconds * time.Second):
-		// Force kill after 5 seconds
-		if killErr := t.cmd.Process.Kill(); killErr != nil && !isProcessAlreadyFinishedError(killErr) {
-			return killErr
-		}
-		// Wait for process to exit after kill
-		<-done
-		return nil
-	case <-t.ctx.Done():
-		// Context canceled - force kill immediately
-		if killErr := t.cmd.Process.Kill(); killErr != nil && !isProcessAlreadyFinishedError(killErr) {
-			return killErr
-		}
-		// Wait for process to exit after kill, but don't return context error
-		// since this is normal cleanup behavior
-		<-done
-		return nil
+	case <-t.processDone:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
 // cleanup cleans up all resources
 func (t *Transport) cleanup() {
+	t.closeChildPipeEnds()
+
 	if t.stdout != nil {
 		_ = t.stdout.Close()
 		t.stdout = nil
@@ -107,4 +119,8 @@ func (t *Transport) cleanup() {
 
 	// Reset state
 	t.cmd = nil
+	t.processDone = nil
+	t.exitMu.Lock()
+	t.exit = nil
+	t.exitMu.Unlock()
 }

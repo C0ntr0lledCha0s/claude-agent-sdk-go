@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/severity1/claude-agent-sdk-go/internal/control"
+	"github.com/severity1/claude-agent-sdk-go/internal/subprocess"
 )
 
 const (
@@ -41,7 +46,7 @@ func testBasicLifecycle(ctx context.Context, t *testing.T) {
 	t.Helper()
 	transport := newClientMockTransport()
 
-	// Test defer-based resource management (Go equivalent of Python context manager)
+	// Test defer-based resource management.
 	func() {
 		client := setupClientForTest(t, transport)
 		defer disconnectClientSafely(t, client)
@@ -146,7 +151,7 @@ func TestClientQueryExecution(t *testing.T) {
 		t.Fatalf("Expected map[string]interface{}, got %T", sentMsg.Message)
 	}
 
-	if role, ok := messageMap["role"]; !ok || role != "user" {
+	if role, ok := messageMap["role"]; !ok || role != userMessageType {
 		t.Errorf("Expected message role 'user', got '%v'", role)
 	}
 	if content, ok := messageMap["content"]; !ok || content != "What is 2+2?" {
@@ -381,6 +386,253 @@ func TestClientCanUseToolAutoConfiguresPermissionPromptToolName(t *testing.T) {
 	}
 }
 
+// TestClientCanUseToolReconnectAndConflict verifies a second Connect still
+// works after the first one set PermissionPromptToolName to "stdio", and a
+// conflicting tool name fails fast (Python raises ValueError).
+func TestClientCanUseToolReconnectAndConflict(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+	callback := func(_ context.Context, _ string, _ map[string]any, _ ToolPermissionContext) (PermissionResult, error) {
+		return NewPermissionResultAllow(), nil
+	}
+
+	client := NewClientWithTransport(newClientMockTransport(), WithCanUseTool(callback))
+	connectClientSafely(ctx, t, client)
+	if err := client.Disconnect(); err != nil {
+		t.Fatalf("Disconnect failed: %v", err)
+	}
+	connectClientSafely(ctx, t, client)
+	disconnectClientSafely(t, client)
+
+	conflict := NewClientWithTransport(newClientMockTransport(),
+		WithCanUseTool(callback), WithPermissionPromptToolName("mcp__perm__ask"))
+	err := conflict.Connect(ctx)
+	if err == nil || !strings.Contains(err.Error(), "cannot be used with PermissionPromptToolName") {
+		t.Fatalf("Connect() error = %v, want CanUseTool conflict error", err)
+	}
+}
+
+// TestIteratorsTreatClosedErrChanAsNoError verifies a closed error channel
+// does not make Next return (nil, nil) or skip buffered messages (Issue #144).
+// The transport closes errChan before msgChan when the CLI exits.
+func TestIteratorsTreatClosedErrChanAsNoError(t *testing.T) {
+	newChannels := func() (chan Message, chan error) {
+		msgChan := make(chan Message, 2)
+		msgChan <- &AssistantMessage{Model: "claude-3"}
+		msgChan <- &AssistantMessage{Model: "claude-3"}
+		close(msgChan)
+		errChan := make(chan error)
+		close(errChan)
+		return msgChan, errChan
+	}
+	drain := func(t *testing.T, iter MessageIterator) {
+		t.Helper()
+		ctx, cancel := setupClientTestContext(t, 5*time.Second)
+		defer cancel()
+		for i := 0; i < 2; i++ {
+			msg, err := iter.Next(ctx)
+			if err != nil || msg == nil {
+				t.Fatalf("Next() #%d = (%v, %v), want a message", i+1, msg, err)
+			}
+		}
+		if _, err := iter.Next(ctx); !errors.Is(err, ErrNoMoreMessages) {
+			t.Fatalf("Next() after drain error = %v, want ErrNoMoreMessages", err)
+		}
+	}
+
+	t.Run("client_iterator", func(t *testing.T) {
+		msgChan, errChan := newChannels()
+		streamErrChan := make(chan error)
+		close(streamErrChan)
+		drain(t, &clientIterator{stream: newStreamReader(msgChan, errChan), streamErrChan: streamErrChan})
+	})
+	t.Run("query_iterator", func(t *testing.T) {
+		msgChan, errChan := newChannels()
+		drain(t, &queryIterator{
+			transport: newQueryMockTransport(),
+			ctx:       context.Background(),
+			started:   true,
+			stream:    newStreamReader(msgChan, errChan),
+		})
+	})
+}
+
+// streamErrorIterators builds each iterator type over hand-fed transport channels.
+func streamErrorIterators() map[string]func(msgChan <-chan Message, errChan <-chan error) MessageIterator {
+	return map[string]func(<-chan Message, <-chan error) MessageIterator{
+		"client_iterator": func(msgChan <-chan Message, errChan <-chan error) MessageIterator {
+			return &clientIterator{stream: newStreamReader(msgChan, errChan)}
+		},
+		"query_iterator": func(msgChan <-chan Message, errChan <-chan error) MessageIterator {
+			return &queryIterator{
+				transport: newQueryMockTransport(),
+				ctx:       context.Background(),
+				started:   true,
+				stream:    newStreamReader(msgChan, errChan),
+			}
+		},
+	}
+}
+
+// streamErrorTrials repeats each scenario on fresh channels. With a message and
+// an error both ready, select picks either at random, so the old code failed a
+// single trial about half the time and fails 50 in a row with probability
+// 1-2^-50.
+const streamErrorTrials = 50
+
+// TestIteratorsDeliverBufferedMessagesBeforeStreamError verifies Next hands out
+// every buffered message before the transport's terminal error, and does not
+// lose that error to a closed msgChan. The transport sends the error after
+// the last message and closes both channels, so Python's ProcessError always
+// follows the last message.
+func TestIteratorsDeliverBufferedMessagesBeforeStreamError(t *testing.T) {
+	exitErr := NewProcessError("Claude Code process exited unexpectedly", 1, "")
+
+	tests := []struct {
+		name        string
+		buffered    int
+		closeMsg    bool
+		wantMessage int
+	}{
+		{"error_ready_while_messages_buffered", 3, true, 3},
+		{"error_ready_with_msgchan_still_open", 3, false, 3},
+		{"msgchan_closed_with_error_in_closed_errchan", 0, true, 0},
+	}
+
+	for name, newIterator := range streamErrorIterators() {
+		for _, tt := range tests {
+			t.Run(name+"/"+tt.name, func(t *testing.T) {
+				ctx, cancel := setupClientTestContext(t, 10*time.Second)
+				defer cancel()
+
+				for trial := 0; trial < streamErrorTrials; trial++ {
+					msgChan := make(chan Message, tt.buffered)
+					for i := 0; i < tt.buffered; i++ {
+						msgChan <- &AssistantMessage{Model: fmt.Sprintf("m%d", i)}
+					}
+					errChan := make(chan error, 1)
+					errChan <- exitErr
+					close(errChan)
+					if tt.closeMsg {
+						close(msgChan)
+					}
+					iter := newIterator(msgChan, errChan)
+
+					for i := 0; i < tt.wantMessage; i++ {
+						msg, err := iter.Next(ctx)
+						if err != nil {
+							t.Fatalf("trial %d: Next() #%d = %v, want message m%d before the error", trial, i+1, err, i)
+						}
+						if got := msg.(*AssistantMessage).Model; got != fmt.Sprintf("m%d", i) {
+							t.Fatalf("trial %d: Next() #%d = %q, want m%d", trial, i+1, got, i)
+						}
+					}
+					if _, err := iter.Next(ctx); err != exitErr {
+						t.Fatalf("trial %d: Next() after %d messages error = %v, want the exit error", trial, tt.wantMessage, err)
+					}
+					if _, err := iter.Next(ctx); !errors.Is(err, ErrNoMoreMessages) {
+						t.Fatalf("trial %d: Next() after the exit error = %v, want ErrNoMoreMessages", trial, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestQueryIteratorDeliversResultBeforeExitError pins the symptom: a CLI that
+// exits non-zero right after an error ResultMessage must still yield that
+// ResultMessage to a consumer that was slow to read.
+func TestQueryIteratorDeliversResultBeforeExitError(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+	exitErr := NewProcessError("Claude Code returned an error result: boom", 1, "")
+
+	for trial := 0; trial < streamErrorTrials; trial++ {
+		msgChan := make(chan Message, 10)
+		for i := 0; i < 9; i++ {
+			msgChan <- &AssistantMessage{Model: "claude-3"}
+		}
+		msgChan <- &ResultMessage{IsError: true, Subtype: "error_during_execution"}
+		errChan := make(chan error, 1)
+		errChan <- exitErr
+		close(errChan)
+		close(msgChan)
+		iter := streamErrorIterators()["query_iterator"](msgChan, errChan)
+
+		sawResult := false
+		var end error
+		for end == nil {
+			msg, err := iter.Next(ctx)
+			if _, ok := msg.(*ResultMessage); ok {
+				sawResult = true
+			}
+			end = err
+		}
+		if !sawResult {
+			t.Fatalf("trial %d: ResultMessage lost to %v", trial, end)
+		}
+		if end != exitErr {
+			t.Fatalf("trial %d: ended with %v, want the exit error", trial, end)
+		}
+	}
+}
+
+// TestReceiveResponseExitErrorBelongsToNextCall verifies the exit error that
+// follows a turn's ResultMessage is not consumed by that turn: ReceiveResponse
+// ends at the ResultMessage (Python receive_response), and the error comes
+// out of the next call.
+func TestReceiveResponseExitErrorBelongsToNextCall(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+	exitErr := NewProcessError("Claude Code returned an error result: boom", 1, "")
+
+	for trial := 0; trial < streamErrorTrials; trial++ {
+		msgChan := make(chan Message, 3)
+		msgChan <- &AssistantMessage{Model: "claude-3"}
+		msgChan <- &AssistantMessage{Model: "claude-3"}
+		msgChan <- &ResultMessage{IsError: true, Subtype: "error_during_execution"}
+		close(msgChan)
+		errChan := make(chan error, 1)
+		errChan <- exitErr
+		close(errChan)
+		stream := newStreamReader(msgChan, errChan)
+
+		turn := &clientIterator{stream: stream}
+		for i := 0; i < 3; i++ {
+			if _, err := turn.Next(ctx); err != nil {
+				t.Fatalf("trial %d: turn Next() #%d = %v, want the turn's messages", trial, i+1, err)
+			}
+		}
+		if _, err := turn.Next(ctx); !errors.Is(err, ErrNoMoreMessages) {
+			t.Fatalf("trial %d: turn Next() after the ResultMessage = %v, want ErrNoMoreMessages", trial, err)
+		}
+
+		next := &clientIterator{stream: stream}
+		if _, err := next.Next(ctx); err != exitErr {
+			t.Fatalf("trial %d: next call = %v, want the exit error", trial, err)
+		}
+	}
+}
+
+// An iterator blocked in next while another sharing the reader sets the error
+// aside must still return that error when msgChan closes under it.
+func TestStreamReaderEndOfStreamReturnsPendingError(t *testing.T) {
+	exitErr := NewProcessError("Claude Code process exited unexpectedly", 1, "")
+	msgChan := make(chan Message)
+	close(msgChan)
+	errChan := make(chan error)
+	close(errChan)
+	stream := newStreamReader(msgChan, errChan)
+
+	stream.setPending(exitErr)
+	if err := stream.endOfStream(); err != exitErr {
+		t.Fatalf("endOfStream() = %v, want the pending exit error", err)
+	}
+	if err := stream.endOfStream(); !errors.Is(err, ErrNoMoreMessages) {
+		t.Fatalf("endOfStream() after the error was taken = %v, want ErrNoMoreMessages", err)
+	}
+}
+
 // TestClientReceiveMessages tests message reception through client channels
 // Covers T137: Client Message Reception
 func TestClientReceiveMessages(t *testing.T) {
@@ -524,6 +776,30 @@ func TestClientResponseIterator(t *testing.T) {
 
 	if receivedCount != len(expectedTexts) {
 		t.Errorf("Expected %d messages, received %d", len(expectedTexts), receivedCount)
+	}
+}
+
+// TestClientReceiveResponseNotConnected tests that ReceiveResponse returns a usable
+// (non-nil) iterator even when the client is not connected.
+func TestClientReceiveResponseNotConnected(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newClientMockTransport()
+	client := setupClientForTest(t, transport)
+	// Intentionally do NOT connect
+
+	iter := client.ReceiveResponse(ctx)
+	if iter == nil {
+		t.Fatal("ReceiveResponse returned nil on disconnected client; expected a closed iterator")
+	}
+
+	msg, err := iter.Next(ctx)
+	if err != ErrNoMoreMessages {
+		t.Errorf("Expected ErrNoMoreMessages from closed iterator, got: %v", err)
+	}
+	if msg != nil {
+		t.Errorf("Expected nil message from closed iterator, got: %v", msg)
 	}
 }
 
@@ -798,6 +1074,281 @@ func TestClientAsyncErrorHandling(t *testing.T) {
 	assertClientMessageCount(t, transport, 1)
 }
 
+// TestClientQueryStreamSendError tests that QueryStream propagates send errors
+// to the ReceiveResponse iterator rather than silently dropping them (C3).
+func TestClientQueryStreamSendError(t *testing.T) {
+	sendErr := fmt.Errorf("send failed")
+	transport := newClientMockTransportWithOptions(WithClientSendError(sendErr))
+	client := setupClientForTest(t, transport)
+	defer disconnectClientSafely(t, client)
+
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	connectClientSafely(ctx, t, client)
+
+	iter := client.ReceiveResponse(ctx)
+	if iter == nil {
+		t.Fatal("Expected non-nil iterator")
+	}
+
+	messages := make(chan StreamMessage, 1)
+	messages <- StreamMessage{
+		Type:    "user",
+		Message: &UserMessage{Content: "hello"},
+	}
+
+	if err := client.QueryStream(ctx, messages); err != nil {
+		t.Fatalf("QueryStream returned unexpected synchronous error: %v", err)
+	}
+
+	// The send error must be propagated to the iterator, not silently dropped.
+	shortCtx, shortCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer shortCancel()
+
+	_, iterErr := iter.Next(shortCtx)
+	if iterErr == nil {
+		t.Fatal("Expected error from iterator after send failure, got nil")
+	}
+	if !strings.Contains(iterErr.Error(), "send failed") {
+		t.Errorf("Expected error containing 'send failed', got: %v", iterErr)
+	}
+}
+
+// TestClientCallsFailAfterProcessExit verifies that once the CLI process has
+// exited, Done is closed, Err reports the exit, and every call that writes to
+// the CLI fails with a *ConnectionError wrapping that exit error instead of
+// being accepted (Python: CLIConnectionError raised from the exit error).
+func TestClientCallsFailAfterProcessExit(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+
+	calls := []struct {
+		name string
+		call func(Client) error
+	}{
+		{"Query", func(c Client) error { return c.Query(ctx, "hello") }},
+		{"QueryWithSession", func(c Client) error { return c.QueryWithSession(ctx, "hello", "s1") }},
+		{"QueryStream", func(c Client) error {
+			messages := make(chan StreamMessage, 1)
+			messages <- StreamMessage{Type: userMessageType, Message: &UserMessage{Content: "hello"}}
+			close(messages)
+			return c.QueryStream(ctx, messages)
+		}},
+		{"Interrupt", func(c Client) error { return c.Interrupt(ctx) }},
+		{"SetModel", func(c Client) error { model := testModelSonnet; return c.SetModel(ctx, &model) }},
+		{"SetPermissionMode", func(c Client) error { return c.SetPermissionMode(ctx, PermissionModeAcceptEdits) }},
+		{"RewindFiles", func(c Client) error { return c.RewindFiles(ctx, "uuid-1") }},
+		{"GetMcpStatus", func(c Client) error { _, err := c.GetMcpStatus(ctx); return err }},
+		{"StopTask", func(c Client) error { return c.StopTask(ctx, "task-1") }},
+	}
+
+	for _, test := range calls {
+		t.Run(test.name, func(t *testing.T) {
+			transport := newProcessMockTransport()
+			client := setupClientForTest(t, transport)
+			defer disconnectClientSafely(t, client)
+			connectClientSafely(ctx, t, client)
+
+			done := client.Done()
+			assertChannelOpen(t, done, "Done() while the CLI runs")
+			if err := client.Err(); err != nil {
+				t.Fatalf("Err() = %v while the CLI runs, want nil", err)
+			}
+
+			exitErr := NewProcessError("Claude Code process exited unexpectedly (signal: killed)", -1, "")
+			transport.exit(exitErr)
+
+			assertChannelClosed(t, done, "Done() after the CLI exited")
+			if err := client.Err(); !errors.Is(err, exitErr) {
+				t.Fatalf("Err() = %v, want the exit error", err)
+			}
+
+			err := test.call(client)
+			if !errors.Is(err, exitErr) || !IsConnectionError(err) {
+				t.Fatalf("%s on a dead client = %v, want a *ConnectionError wrapping the exit error", test.name, err)
+			}
+			assertClientMessageCount(t, transport.clientMockTransport, 0)
+		})
+	}
+}
+
+// TestClientDoneAndErrLifecycle verifies Done and Err before Connect, while
+// connected, after Disconnect and after a reconnect. A transport that does not
+// report its process gets a Done that closes on Disconnect.
+func TestClientDoneAndErrLifecycle(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+
+	tests := []struct {
+		name      string
+		transport func() Transport
+	}{
+		{"process_transport", func() Transport { return newProcessMockTransport() }},
+		{"custom_transport_fallback", func() Transport { return newClientMockTransport() }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := setupClientForTest(t, test.transport())
+
+			assertChannelClosed(t, client.Done(), "Done() before Connect")
+			assertClientError(t, client.Err(), true, "client not connected")
+
+			connectClientSafely(ctx, t, client)
+			done := client.Done()
+			assertChannelOpen(t, done, "Done() while connected")
+			assertNoError(t, client.Err())
+
+			disconnectClientSafely(t, client)
+			assertChannelClosed(t, done, "Done() of the connection after Disconnect")
+			assertChannelClosed(t, client.Done(), "Done() after Disconnect")
+			assertClientError(t, client.Err(), true, "client not connected")
+
+			connectClientSafely(ctx, t, client)
+			defer disconnectClientSafely(t, client)
+			assertChannelOpen(t, client.Done(), "Done() after reconnecting")
+			assertNoError(t, client.Err())
+		})
+	}
+}
+
+// TestClientDoneAndErrDoNotBlockDuringDisconnect verifies that Done and Err
+// return at once while Disconnect waits for a slow transport Close.
+func TestClientDoneAndErrDoNotBlockDuringDisconnect(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+
+	transport := &blockingCloseTransport{
+		processMockTransport: newProcessMockTransport(),
+		closing:              make(chan struct{}),
+		release:              make(chan struct{}),
+	}
+	client := setupClientForTest(t, transport)
+	connectClientSafely(ctx, t, client)
+
+	disconnected := make(chan error, 1)
+	go func() { disconnected <- client.Disconnect() }()
+	<-transport.closing
+
+	returned := make(chan struct{})
+	go func() {
+		_ = client.Done()
+		_ = client.Err()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Error("Done() or Err() blocked while Disconnect ran")
+	}
+
+	close(transport.release)
+	if err := <-disconnected; err != nil {
+		t.Fatalf("Disconnect() = %v", err)
+	}
+}
+
+// TestClientNotConnectedErrors verifies that every call on a client that is
+// not connected returns a *ConnectionError that wraps ErrNotConnected.
+func TestClientNotConnectedErrors(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+
+	calls := []struct {
+		name string
+		call func(Client) error
+	}{
+		{"Query", func(c Client) error { return c.Query(ctx, "hello") }},
+		{"QueryWithSession", func(c Client) error { return c.QueryWithSession(ctx, "hello", "s1") }},
+		{"QueryStream", func(c Client) error { return c.QueryStream(ctx, make(chan StreamMessage)) }},
+		{"Interrupt", func(c Client) error { return c.Interrupt(ctx) }},
+		{"SetModel", func(c Client) error { model := testModelSonnet; return c.SetModel(ctx, &model) }},
+		{"SetPermissionMode", func(c Client) error { return c.SetPermissionMode(ctx, PermissionModeAcceptEdits) }},
+		{"RewindFiles", func(c Client) error { return c.RewindFiles(ctx, "uuid-1") }},
+		{"GetMcpStatus", func(c Client) error { _, err := c.GetMcpStatus(ctx); return err }},
+		{"StopTask", func(c Client) error { return c.StopTask(ctx, "task-1") }},
+		{"GetServerInfo", func(c Client) error { _, err := c.GetServerInfo(ctx); return err }},
+		{"Err", func(c Client) error { return c.Err() }},
+	}
+
+	states := []struct {
+		name  string
+		setup func(t *testing.T, c Client)
+	}{
+		{"before_connect", func(*testing.T, Client) {}},
+		{"after_disconnect", func(t *testing.T, c Client) {
+			connectClientSafely(ctx, t, c)
+			disconnectClientSafely(t, c)
+		}},
+	}
+
+	for _, state := range states {
+		for _, test := range calls {
+			t.Run(state.name+"/"+test.name, func(t *testing.T) {
+				client := setupClientForTest(t, newClientMockTransport())
+				state.setup(t, client)
+
+				err := test.call(client)
+				if !errors.Is(err, ErrNotConnected) || !IsConnectionError(err) {
+					t.Fatalf("%s = %v, want a *ConnectionError wrapping ErrNotConnected", test.name, err)
+				}
+			})
+		}
+	}
+}
+
+// TestErrProtocolClosedIsExported verifies that callers can match the
+// control protocol's closed error with errors.Is.
+func TestErrProtocolClosedIsExported(t *testing.T) {
+	err := fmt.Errorf("interrupt: %w", control.ErrProtocolClosed)
+	if !errors.Is(err, ErrProtocolClosed) {
+		t.Fatalf("errors.Is(%v, ErrProtocolClosed) = false", err)
+	}
+}
+
+// TestStreamReaderSharedPendingError verifies that when two iterators share
+// one pending error, one gets it and the other keeps reading: neither gets
+// (nil, nil).
+func TestStreamReaderSharedPendingError(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		stream := newStreamReader(make(chan Message), make(chan error))
+		exitErr := errors.New("exit")
+		stream.setPending(exitErr)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		results := make(chan error, 2)
+		for g := 0; g < 2; g++ {
+			go func() {
+				msg, err := stream.next(ctx, nil)
+				if msg == nil && err == nil {
+					results <- errors.New("next returned (nil, nil)")
+					return
+				}
+				results <- err
+			}()
+		}
+		first, second := <-results, <-results
+		cancel()
+
+		gotExit := errors.Is(first, exitErr) != errors.Is(second, exitErr)
+		gotCtx := errors.Is(first, context.DeadlineExceeded) != errors.Is(second, context.DeadlineExceeded)
+		if !gotExit || !gotCtx {
+			t.Fatalf("iteration %d: results %v and %v, want the exit error once and a deadline error once", i, first, second)
+		}
+	}
+}
+
+// TestSubprocessTransportReportsProcessExit guards the optional interface
+// that Done and Err type-assert: if the subprocess transport stopped
+// satisfying it, Done would silently close only on Disconnect.
+func TestSubprocessTransportReportsProcessExit(t *testing.T) {
+	var transport Transport = subprocess.New("claude", NewOptions(), "sdk-go-client")
+	if _, ok := transport.(processWatcher); !ok {
+		t.Fatal("subprocess.Transport does not implement processWatcher")
+	}
+}
+
 // TestClientResponseSequencing tests pre-configured response sequences
 // Covers T137: Client Message Reception + T138: Client Response Iterator + T147: Client Message Ordering
 func TestClientResponseSequencing(t *testing.T) {
@@ -1008,7 +1559,6 @@ func TestClientIteratorClose(t *testing.T) {
 	}
 }
 
-// Mock Transport Implementation - simplified following options_test.go patterns
 type clientMockTransport struct {
 	mu           sync.Mutex
 	connected    bool
@@ -1029,6 +1579,10 @@ type clientMockTransport struct {
 	setModelError          error
 	setPermissionModeError error
 	rewindFilesError       error
+	getMcpStatusError      error
+	getMcpStatusResponse   *McpStatusResponse
+	stopTaskError          error
+	stoppedTaskIDs         []string
 }
 
 func (c *clientMockTransport) Connect(ctx context.Context) error {
@@ -1116,6 +1670,10 @@ func (c *clientMockTransport) Interrupt(_ context.Context) error {
 	return nil
 }
 
+func (c *clientMockTransport) EndInput(_ context.Context) error {
+	return nil
+}
+
 func (c *clientMockTransport) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1196,7 +1754,7 @@ func (c *clientMockTransport) SetModel(_ context.Context, _ *string) error {
 	return nil
 }
 
-func (c *clientMockTransport) SetPermissionMode(_ context.Context, _ string) error {
+func (c *clientMockTransport) SetPermissionMode(_ context.Context, _ PermissionMode) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.setPermissionModeError != nil {
@@ -1212,6 +1770,137 @@ func (c *clientMockTransport) RewindFiles(_ context.Context, _ string) error {
 		return c.rewindFilesError
 	}
 	return nil
+}
+
+func (c *clientMockTransport) GetMcpStatus(_ context.Context) (*McpStatusResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.getMcpStatusError != nil {
+		return nil, c.getMcpStatusError
+	}
+	if c.getMcpStatusResponse != nil {
+		return c.getMcpStatusResponse, nil
+	}
+	return &McpStatusResponse{McpServers: []McpServerStatus{}}, nil
+}
+
+// processMockTransport is a clientMockTransport that reports the exit of its
+// CLI process through Done and Err, like the subprocess transport.
+type processMockTransport struct {
+	*clientMockTransport
+	procMu  sync.Mutex
+	done    chan struct{}
+	exitErr error
+}
+
+func newProcessMockTransport() *processMockTransport {
+	return &processMockTransport{clientMockTransport: newClientMockTransport()}
+}
+
+func (p *processMockTransport) Connect(ctx context.Context) error {
+	if err := p.clientMockTransport.Connect(ctx); err != nil {
+		return err
+	}
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	p.done = make(chan struct{})
+	p.exitErr = nil
+	return nil
+}
+
+// exit simulates the CLI process exiting with err.
+func (p *processMockTransport) exit(err error) {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	if p.done == nil || p.exitErr != nil {
+		return
+	}
+	p.exitErr = err
+	close(p.done)
+}
+
+func (p *processMockTransport) Close() error {
+	if err := p.clientMockTransport.Close(); err != nil {
+		return err
+	}
+	p.exit(errors.New("transport closed"))
+	return nil
+}
+
+func (p *processMockTransport) Done() <-chan struct{} {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	return p.done
+}
+
+func (p *processMockTransport) Err() error {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	return p.exitErr
+}
+
+// blockingCloseTransport is a processMockTransport whose Close signals
+// closing and then waits for release.
+type blockingCloseTransport struct {
+	*processMockTransport
+	closing chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingCloseTransport) Close() error {
+	close(b.closing)
+	<-b.release
+	return b.processMockTransport.Close()
+}
+
+// serverInfoTransport is a clientMockTransport that keeps an initialize
+// response, like the subprocess transport.
+type serverInfoTransport struct {
+	*clientMockTransport
+}
+
+func newServerInfoTransport() Transport {
+	return &serverInfoTransport{clientMockTransport: newClientMockTransport()}
+}
+
+func (s *serverInfoTransport) InitializationResult() map[string]interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.connected {
+		return nil
+	}
+	return testInitializeResponse()
+}
+
+// testInitializeResponse is an initialize response in the shape the CLI sends.
+func testInitializeResponse() map[string]interface{} {
+	return map[string]interface{}{
+		"commands":                []interface{}{map[string]interface{}{"name": "compact", "description": "Compact the conversation"}},
+		"output_style":            "default",
+		"available_output_styles": []interface{}{"default", "Explanatory"},
+		"models": []interface{}{
+			map[string]interface{}{
+				"value": "opus[1m]", "displayName": "Opus (1M context)", "description": "Most capable",
+				"supportsEffort": true, "supportedEffortLevels": []interface{}{"low", "high"},
+			},
+		},
+	}
+}
+
+func (c *clientMockTransport) StopTask(_ context.Context, taskID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopTaskError != nil {
+		return c.stopTaskError
+	}
+	c.stoppedTaskIDs = append(c.stoppedTaskIDs, taskID)
+	return nil
+}
+
+func (c *clientMockTransport) getStoppedTaskIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.stoppedTaskIDs...)
 }
 
 // Streamlined Mock Transport Options - reduced from 11 to 6 essential functions
@@ -1247,6 +1936,18 @@ func WithClientSetPermissionModeError(err error) ClientMockTransportOption {
 
 func WithClientRewindFilesError(err error) ClientMockTransportOption {
 	return func(t *clientMockTransport) { t.rewindFilesError = err }
+}
+
+func WithClientGetMcpStatusError(err error) ClientMockTransportOption {
+	return func(t *clientMockTransport) { t.getMcpStatusError = err }
+}
+
+func WithClientGetMcpStatusResponse(resp *McpStatusResponse) ClientMockTransportOption {
+	return func(t *clientMockTransport) { t.getMcpStatusResponse = resp }
+}
+
+func WithClientStopTaskError(err error) ClientMockTransportOption {
+	return func(t *clientMockTransport) { t.stopTaskError = err }
 }
 
 // Factory Functions - streamlined creation methods
@@ -1341,6 +2042,24 @@ func assertClientMessageCount(t *testing.T, transport *clientMockTransport, expe
 	actual := transport.getSentMessageCount()
 	if actual != expected {
 		t.Errorf("Expected %d sent messages, got %d", expected, actual)
+	}
+}
+
+func assertChannelOpen(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("%s is closed, want open", what)
+	default:
+	}
+}
+
+func assertChannelClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("%s is open, want closed", what)
 	}
 }
 
@@ -1568,8 +2287,8 @@ func verifyIteratorClose(t *testing.T, client Client, _ *clientMockTransport, te
 	}
 }
 
-// TestClientContextManager tests Go-idiomatic context manager pattern following Python SDK parity
-// Covers the single critical improvement: automatic resource lifecycle management
+// TestClientContextManager tests automatic resource lifecycle management
+// via the Go-idiomatic context manager pattern.
 func TestClientContextManager(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -1859,7 +2578,7 @@ func TestClientPythonSDKCompatibility(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected Message to be map[string]interface{}, got %T", sentMsg.Message)
 	}
-	if role, ok := messageMap["role"]; !ok || role != "user" {
+	if role, ok := messageMap["role"]; !ok || role != userMessageType {
 		t.Errorf("Expected message role 'user', got '%v'", role)
 	}
 	if content, ok := messageMap["content"]; !ok || content != "Test streaming with Python SDK format" {
@@ -1923,7 +2642,7 @@ func TestClientPythonSDKCompatibility(t *testing.T) {
 		t.Fatal("ReceiveResponse returned nil iterator")
 	}
 
-	// Test that iterator can be closed immediately (following existing test patterns)
+	// Test that iterator can be closed immediately.
 	err = iter.Close()
 	assertNoError(t, err)
 }
@@ -2008,9 +2727,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  true, // Already closed
+					stream: newStreamReader(msgChan, errChan),
+					closed: true, // Already closed
 				}
 				ctx, cancel := setupClientTestContext(t, 5*time.Second)
 				return iter, ctx, cancel
@@ -2032,9 +2750,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  false,
+					stream: newStreamReader(msgChan, errChan),
+					closed: false,
 				}
 				ctx, cancel := setupClientTestContext(t, 50*time.Millisecond)
 				return iter, ctx, cancel
@@ -2056,9 +2773,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error, 1)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  false,
+					stream: newStreamReader(msgChan, errChan),
+					closed: false,
 				}
 
 				// Send error to error channel
@@ -2088,9 +2804,8 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 				msgChan := make(chan Message)
 				errChan := make(chan error)
 				iter := &clientIterator{
-					msgChan: msgChan,
-					errChan: errChan,
-					closed:  false,
+					stream: newStreamReader(msgChan, errChan),
+					closed: false,
 				}
 
 				// Close the message channel
@@ -2127,8 +2842,7 @@ func TestClientIteratorNextErrorPaths(t *testing.T) {
 	}
 }
 
-// ===== NEW CLEAN API TESTS =====
-// These tests are for the new clean Query API without variadic parameters
+// Tests for the Query API without variadic parameters.
 
 func TestClientQueryDefaultSession(t *testing.T) {
 	ctx, cancel := setupClientTestContext(t, 5*time.Second)
@@ -2330,115 +3044,25 @@ func TestClientQueryNotConnectedError(t *testing.T) {
 	}
 }
 
-// TestGetServerInfo tests the GetServerInfo method for diagnostic information retrieval
-// Covers Issue #13: Add GetServerInfo Method for Diagnostics
+// TestGetServerInfo verifies that GetServerInfo returns the initialize
+// response the CLI sent (Python get_server_info returns
+// Query._initialization_result), and an error when not connected.
 func TestGetServerInfo(t *testing.T) {
 	tests := []struct {
-		name     string
-		setup    func() (*clientMockTransport, Client)
-		connect  bool
-		wantErr  bool
-		validate func(*testing.T, map[string]interface{}, error)
+		name       string
+		transport  func() Transport
+		connect    bool
+		disconnect bool
+		query      bool
+		wantErr    bool
+		want       map[string]interface{}
 	}{
-		{
-			name: "returns_error_when_not_connected",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: false,
-			wantErr: true,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err == nil {
-					t.Error("Expected error when not connected")
-					return
-				}
-				if !strings.Contains(err.Error(), "not connected") {
-					t.Errorf("Expected error to contain 'not connected', got: %v", err)
-				}
-				if info != nil {
-					t.Errorf("Expected nil info when not connected, got: %v", info)
-				}
-			},
-		},
-		{
-			name: "returns_info_when_connected",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: true,
-			wantErr: false,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err != nil {
-					t.Errorf("Expected no error, got: %v", err)
-					return
-				}
-				if info == nil {
-					t.Error("Expected info map, got nil")
-					return
-				}
-				// Verify expected fields
-				if connected, ok := info["connected"].(bool); !ok || !connected {
-					t.Errorf("Expected connected=true, got: %v", info["connected"])
-				}
-				if transportType, ok := info["transport_type"].(string); !ok || transportType != "subprocess" {
-					t.Errorf("Expected transport_type='subprocess', got: %v", info["transport_type"])
-				}
-			},
-		},
-		{
-			name: "returns_info_after_query",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: true,
-			wantErr: false,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err != nil {
-					t.Errorf("Expected no error after query, got: %v", err)
-					return
-				}
-				if info == nil {
-					t.Error("Expected info map after query, got nil")
-					return
-				}
-				// Should still show connected after operations
-				if connected, ok := info["connected"].(bool); !ok || !connected {
-					t.Errorf("Expected connected=true after query, got: %v", info["connected"])
-				}
-			},
-		},
-		{
-			name: "returns_error_after_disconnect",
-			setup: func() (*clientMockTransport, Client) {
-				transport := newClientMockTransport()
-				client := setupClientForTest(t, transport)
-				return transport, client
-			},
-			connect: true, // Will connect then disconnect before calling GetServerInfo
-			wantErr: true,
-			validate: func(t *testing.T, info map[string]interface{}, err error) {
-				t.Helper()
-				if err == nil {
-					t.Error("Expected error after disconnect")
-					return
-				}
-				if !strings.Contains(err.Error(), "not connected") {
-					t.Errorf("Expected error to contain 'not connected', got: %v", err)
-				}
-				if info != nil {
-					t.Errorf("Expected nil info after disconnect, got: %v", info)
-				}
-			},
-		},
+		{name: "not_connected", transport: newServerInfoTransport, wantErr: true},
+		{name: "initialize_response", transport: newServerInfoTransport, connect: true, want: testInitializeResponse()},
+		{name: "after_query", transport: newServerInfoTransport, connect: true, query: true, want: testInitializeResponse()},
+		{name: "after_disconnect", transport: newServerInfoTransport, connect: true, disconnect: true, wantErr: true},
+		// A transport that does not keep the response has no server info (Python: None).
+		{name: "custom_transport", transport: func() Transport { return newClientMockTransport() }, connect: true},
 	}
 
 	for _, test := range tests {
@@ -2446,26 +3070,24 @@ func TestGetServerInfo(t *testing.T) {
 			ctx, cancel := setupClientTestContext(t, 5*time.Second)
 			defer cancel()
 
-			_, client := test.setup()
+			client := setupClientForTest(t, test.transport())
 			defer disconnectClientSafely(t, client)
 
 			if test.connect {
 				connectClientSafely(ctx, t, client)
 			}
-
-			// For the "after query" test, send a query first
-			if test.name == "returns_info_after_query" {
-				err := client.Query(ctx, "test message")
-				assertNoError(t, err)
+			if test.query {
+				assertNoError(t, client.Query(ctx, "test message"))
 			}
-
-			// For the "after disconnect" test, disconnect before calling GetServerInfo
-			if test.name == "returns_error_after_disconnect" {
+			if test.disconnect {
 				disconnectClientSafely(t, client)
 			}
 
 			info, err := client.GetServerInfo(ctx)
-			test.validate(t, info, err)
+			assertClientError(t, err, test.wantErr, "not connected")
+			if !reflect.DeepEqual(info, test.want) {
+				t.Errorf("GetServerInfo() = %v, want %v", info, test.want)
+			}
 		})
 	}
 }
@@ -2475,14 +3097,13 @@ func TestGetServerInfoConcurrent(t *testing.T) {
 	ctx, cancel := setupClientTestContext(t, 15*time.Second)
 	defer cancel()
 
-	transport := newClientMockTransport()
-	client := setupClientForTest(t, transport)
+	client := setupClientForTest(t, newServerInfoTransport())
 	defer disconnectClientSafely(t, client)
 
 	connectClientSafely(ctx, t, client)
 
 	const numGoroutines = 10
-	errors := make(chan error, numGoroutines)
+	errs := make(chan error, numGoroutines)
 	results := make(chan map[string]interface{}, numGoroutines)
 
 	var wg sync.WaitGroup
@@ -2492,7 +3113,7 @@ func TestGetServerInfoConcurrent(t *testing.T) {
 			defer wg.Done()
 			info, err := client.GetServerInfo(ctx)
 			if err != nil {
-				errors <- err
+				errs <- err
 				return
 			}
 			results <- info
@@ -2500,31 +3121,28 @@ func TestGetServerInfoConcurrent(t *testing.T) {
 	}
 
 	wg.Wait()
-	close(errors)
+	close(errs)
 	close(results)
 
-	// Check for errors
-	for err := range errors {
+	for err := range errs {
 		t.Errorf("Concurrent GetServerInfo error: %v", err)
 	}
-
-	// Verify all results are consistent
-	var prevConnected bool
-	first := true
 	for info := range results {
-		connected := info["connected"].(bool)
-		if first {
-			prevConnected = connected
-			first = false
-		} else if connected != prevConnected {
-			t.Error("Inconsistent connected state across concurrent calls")
+		if !reflect.DeepEqual(info, testInitializeResponse()) {
+			t.Errorf("GetServerInfo() = %v, want the initialize response", info)
 		}
 	}
 }
 
-// =============================================================================
-// Dynamic Control Methods Tests (SetModel, SetPermissionMode) - Issues #51, #52
-// =============================================================================
+// TestSubprocessTransportKeepsServerInfo guards the optional interface that
+// GetServerInfo type-asserts: if the subprocess transport stopped satisfying
+// it, GetServerInfo would silently return nil.
+func TestSubprocessTransportKeepsServerInfo(t *testing.T) {
+	var transport Transport = subprocess.New("claude", NewOptions(), "sdk-go-client")
+	if _, ok := transport.(serverInfoSource); !ok {
+		t.Fatal("subprocess.Transport does not implement serverInfoSource")
+	}
+}
 
 func TestClientDynamicControl(t *testing.T) {
 	t.Run("set_model", testClientSetModel)
@@ -2711,10 +3329,6 @@ func testClientSetPermissionModeTransportError(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// RewindFiles Tests (Issue #32)
-// =============================================================================
-
 func TestClientRewindFiles(t *testing.T) {
 	t.Run("success", testClientRewindFilesSuccess)
 	t.Run("not_connected", testClientRewindFilesNotConnected)
@@ -2800,6 +3414,346 @@ func testClientRewindFilesTransportError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "transport rewind files error") {
 		t.Errorf("expected transport error, got: %v", err)
+	}
+}
+
+// TestClientGetMcpStatus tests GetMcpStatus delegation through the client layer.
+func TestClientGetMcpStatus(t *testing.T) {
+	t.Run("success", testClientGetMcpStatusSuccess)
+	t.Run("not_connected", testClientGetMcpStatusNotConnected)
+	t.Run("context_cancelled", testClientGetMcpStatusContextCancelled)
+	t.Run("transport_error", testClientGetMcpStatusTransportError)
+}
+
+func testClientGetMcpStatusSuccess(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	serverName := "test-server"
+	scope := "local"
+	resp := &McpStatusResponse{
+		McpServers: []McpServerStatus{
+			{
+				Name:   serverName,
+				Status: McpServerConnectionStatusConnected,
+				Scope:  &scope,
+			},
+		},
+	}
+	transport := newClientMockTransportWithOptions(
+		WithClientGetMcpStatusResponse(resp),
+	)
+	client := setupClientForTest(t, transport)
+	defer disconnectClientSafely(t, client)
+
+	connectClientSafely(ctx, t, client)
+
+	got, err := client.GetMcpStatus(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil response")
+	}
+	if len(got.McpServers) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(got.McpServers))
+	}
+	if got.McpServers[0].Name != serverName {
+		t.Errorf("expected server name %q, got %q", serverName, got.McpServers[0].Name)
+	}
+	if got.McpServers[0].Status != McpServerConnectionStatusConnected {
+		t.Errorf("expected status connected, got %q", got.McpServers[0].Status)
+	}
+}
+
+func testClientGetMcpStatusNotConnected(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newClientMockTransport()
+	client := setupClientForTest(t, transport)
+	defer disconnectClientSafely(t, client)
+
+	_, err := client.GetMcpStatus(ctx)
+
+	if err == nil {
+		t.Fatal("expected error when not connected, got nil")
+	}
+	if !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("expected 'not connected' error, got: %v", err)
+	}
+}
+
+func testClientGetMcpStatusContextCancelled(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	transport := newClientMockTransport()
+	client := setupClientForTest(t, transport)
+	defer disconnectClientSafely(t, client)
+
+	connectClientSafely(ctx, t, client)
+
+	cancel()
+
+	_, err := client.GetMcpStatus(ctx)
+
+	if err == nil {
+		t.Fatal("expected error when context cancelled, got nil")
+	}
+}
+
+func testClientGetMcpStatusTransportError(t *testing.T) {
+	t.Helper()
+
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	expectedErr := errors.New("transport mcp status error")
+	transport := newClientMockTransportWithOptions(
+		WithClientGetMcpStatusError(expectedErr),
+	)
+	client := setupClientForTest(t, transport)
+	defer disconnectClientSafely(t, client)
+
+	connectClientSafely(ctx, t, client)
+
+	_, err := client.GetMcpStatus(ctx)
+
+	if err == nil {
+		t.Fatal("expected error from transport, got nil")
+	}
+	if !strings.Contains(err.Error(), "transport mcp status error") {
+		t.Errorf("expected transport error, got: %v", err)
+	}
+}
+
+// TestClientStopTask tests StopTask delegation through the client layer.
+func TestClientStopTask(t *testing.T) {
+	tests := []struct {
+		name        string
+		options     []ClientMockTransportOption
+		connect     bool
+		cancelFirst bool
+		wantErr     string
+		wantStopped []string
+	}{
+		{
+			name:        "success",
+			connect:     true,
+			wantStopped: []string{"task-abc123"},
+		},
+		{
+			name:    "not_connected",
+			wantErr: "not connected",
+		},
+		{
+			name:        "context_cancelled",
+			connect:     true,
+			cancelFirst: true,
+			wantErr:     "context canceled",
+		},
+		{
+			name:    "transport_error",
+			options: []ClientMockTransportOption{WithClientStopTaskError(errors.New("transport stop task error"))},
+			connect: true,
+			wantErr: "transport stop task error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := setupClientTestContext(t, 5*time.Second)
+			defer cancel()
+
+			transport := newClientMockTransportWithOptions(tt.options...)
+			client := setupClientForTest(t, transport)
+			defer disconnectClientSafely(t, client)
+
+			if tt.connect {
+				connectClientSafely(ctx, t, client)
+			}
+			if tt.cancelFirst {
+				cancel()
+			}
+
+			err := client.StopTask(ctx, "task-abc123")
+
+			assertClientErrorContains(t, err, tt.wantErr)
+			if got := transport.getStoppedTaskIDs(); fmt.Sprint(got) != fmt.Sprint(tt.wantStopped) {
+				t.Errorf("stopped task IDs = %v, want %v", got, tt.wantStopped)
+			}
+		})
+	}
+}
+
+func assertClientErrorContains(t *testing.T, err error, want string) {
+	t.Helper()
+	if want == "" {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatalf("expected error containing %q, got nil", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("expected error containing %q, got: %v", want, err)
+	}
+}
+
+// TestClientIteratorStopsAfterResultMessage pins Python receive_response(): yield up to and including the ResultMessage.
+func TestClientIteratorStopsAfterResultMessage(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	msgChan := make(chan Message, 3)
+	msgChan <- &AssistantMessage{Content: []ContentBlock{&TextBlock{Text: "first"}}}
+	msgChan <- &ResultMessage{SessionID: "s1"}
+	msgChan <- &AssistantMessage{Content: []ContentBlock{&TextBlock{Text: "next turn"}}}
+	iter := &clientIterator{stream: newStreamReader(msgChan, make(chan error))}
+
+	if msg, err := iter.Next(ctx); err != nil {
+		t.Fatalf("first Next: %v", err)
+	} else if _, ok := msg.(*AssistantMessage); !ok {
+		t.Fatalf("first Next = %T, want *AssistantMessage", msg)
+	}
+	if msg, err := iter.Next(ctx); err != nil {
+		t.Fatalf("second Next: %v", err)
+	} else if _, ok := msg.(*ResultMessage); !ok {
+		t.Fatalf("second Next = %T, want *ResultMessage", msg)
+	}
+	if msg, err := iter.Next(ctx); !errors.Is(err, ErrNoMoreMessages) {
+		t.Fatalf("Next after ResultMessage = (%T, %v), want ErrNoMoreMessages", msg, err)
+	}
+	if got := len(msgChan); got != 1 {
+		t.Errorf("iterator consumed the next turn: %d messages left in channel, want 1", got)
+	}
+}
+
+// TestClientReceiveResponseMultiTurn verifies each ReceiveResponse ends at its own turn's ResultMessage.
+func TestClientReceiveResponseMultiTurn(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 5*time.Second)
+	defer cancel()
+
+	transport := newClientMockTransport()
+	client := setupClientForTest(t, transport)
+	defer disconnectClientSafely(t, client)
+	connectClientSafely(ctx, t, client)
+
+	for turn := 1; turn <= 2; turn++ {
+		text := fmt.Sprintf("answer %d", turn)
+		assertNoError(t, client.Query(ctx, fmt.Sprintf("question %d", turn)))
+		transport.injectTestMessage(&AssistantMessage{Content: []ContentBlock{&TextBlock{Text: text}}})
+		transport.injectTestMessage(&ResultMessage{SessionID: "s1"})
+
+		iter := client.ReceiveResponse(ctx)
+		var got []Message
+		for {
+			msg, err := iter.Next(ctx)
+			if errors.Is(err, ErrNoMoreMessages) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("turn %d: Next: %v", turn, err)
+			}
+			got = append(got, msg)
+		}
+		if len(got) != 2 {
+			t.Fatalf("turn %d: got %d messages, want 2", turn, len(got))
+		}
+		assistant, ok := got[0].(*AssistantMessage)
+		if !ok {
+			t.Fatalf("turn %d: first message = %T, want *AssistantMessage", turn, got[0])
+		}
+		if tb, ok := assistant.Content[0].(*TextBlock); !ok || tb.Text != text {
+			t.Errorf("turn %d: text = %v, want %q", turn, assistant.Content[0], text)
+		}
+		if _, ok := got[1].(*ResultMessage); !ok {
+			t.Errorf("turn %d: last message = %T, want *ResultMessage", turn, got[1])
+		}
+	}
+}
+
+// TestValidateWindowsArgValue pins Python _reject_windows_cmd_metacharacters: Windows only, cmd.exe metacharacters and CR/LF.
+func TestValidateWindowsArgValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		goos    string
+		value   string
+		wantErr bool
+	}{
+		{"windows_uuid", "windows", "550e8400-e29b-41d4-a716-446655440000", false},
+		{"windows_title_with_space", "windows", "my session title", false},
+		{"windows_dash_value", "windows", "--version", false},
+		{"windows_ampersand", "windows", "abc & calc.exe", true},
+		{"windows_pipe", "windows", "a|b", true},
+		{"windows_redirect_in", "windows", "a<b", true},
+		{"windows_redirect_out", "windows", "a>b", true},
+		{"windows_caret", "windows", "a^b", true},
+		{"windows_percent", "windows", "%PATH%", true},
+		{"windows_bang", "windows", "!x!", true},
+		{"windows_quote", "windows", `a"b`, true},
+		{"windows_cr", "windows", "a\rb", true},
+		{"windows_lf", "windows", "a\nb", true},
+		{"linux_metacharacters_allowed", "linux", `a&|<>^%!"b`, false},
+		{"darwin_newline_allowed", "darwin", "a\nb", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWindowsArgValue(tt.goos, "resume", tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateWindowsArgValue(%q, %q) error = %v, wantErr %v", tt.goos, tt.value, err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "resume") {
+				t.Errorf("error %q does not name the option", err)
+			}
+		})
+	}
+}
+
+// TestValidateWindowsArgs pins Python _reject_windows_cmd_metacharacters for each argv value option.
+func TestValidateWindowsArgs(t *testing.T) {
+	bad := "x&calc"
+	tests := []struct {
+		name    string
+		goos    string
+		options *Options
+		wantErr string
+	}{
+		{"resume_windows", windowsOS, &Options{Resume: &bad}, "resume"},
+		{"resume_session_at_windows", windowsOS, &Options{ResumeSessionAt: &bad}, "resume_session_at"},
+		{"resume_drops_turn_windows", windowsOS, &Options{ResumeDropsTurn: &bad}, "resume_drops_turn"},
+		{"resume_session_at_linux", "linux", &Options{ResumeSessionAt: &bad}, ""},
+		{"unset_windows", windowsOS, &Options{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWindowsArgs(tt.goos, tt.options)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateWindowsArgs() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.HasPrefix(err.Error(), tt.wantErr+" value") {
+				t.Fatalf("validateWindowsArgs() error = %v, want an error that names %s", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestPrepareOptionsResumeMetacharacters covers the call site: only Windows rejects the value.
+func TestPrepareOptionsResumeMetacharacters(t *testing.T) {
+	resume := "abc & calc.exe"
+	err := prepareOptions(&Options{Resume: &resume})
+	if wantErr := runtime.GOOS == windowsOS; (err != nil) != wantErr {
+		t.Fatalf("prepareOptions(Resume=%q) on %s: error = %v, wantErr %v", resume, runtime.GOOS, err, wantErr)
 	}
 }
 

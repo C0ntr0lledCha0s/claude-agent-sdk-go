@@ -9,10 +9,6 @@ import (
 	"time"
 )
 
-// =============================================================================
-// MCP Message Handler Tests (Issue #7)
-// =============================================================================
-
 // TestMcpMessageRouting tests the MCP message routing logic.
 func TestMcpMessageRouting(t *testing.T) {
 	tests := []struct {
@@ -148,6 +144,170 @@ func TestMcpToolsListResponse(t *testing.T) {
 
 	if len(tools) != 2 {
 		t.Errorf("Expected 2 tools, got %d", len(tools))
+	}
+}
+
+// TestMcpToolsListResponseWithAnnotations verifies that tools/list response
+// includes the "annotations" key only for tools whose Annotations field is
+// non-nil. A nil pointer omits the key; a non-nil but empty value still
+// emits the key with an empty map (all fields are pointers with omitempty,
+// so an empty struct produces no map entries but the key itself is present).
+func TestMcpToolsListResponseWithAnnotations(t *testing.T) {
+	ctx, cancel := setupMcpTestContext(t, 5*time.Second)
+	defer cancel()
+
+	title := "Annotated"
+	readOnly := true
+	server := newMockMcpServer("test", "1.0.0")
+	server.tools = []McpToolDefinition{
+		{
+			Name:        "with_ann",
+			Description: "Has partial annotations",
+			InputSchema: map[string]any{"type": "object"},
+			Annotations: &ToolAnnotations{
+				Title:        &title,
+				ReadOnlyHint: &readOnly,
+			},
+		},
+		{
+			Name:        "no_ann",
+			Description: "No annotations",
+			InputSchema: map[string]any{"type": "object"},
+		},
+		{
+			Name:        "empty_ann",
+			Description: "Non-nil but all-fields-unset annotations",
+			InputSchema: map[string]any{"type": "object"},
+			Annotations: &ToolAnnotations{},
+		},
+	}
+
+	p := NewProtocol(newMcpMockTransport(), WithSdkMcpServers(map[string]McpServer{"test": server}))
+
+	msg := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/list",
+	}
+
+	result, err := p.routeMcpMethod(ctx, server, msg)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	resultData, ok := result["result"].(map[string]any)
+	if !ok {
+		t.Fatal("Expected result to be a map")
+	}
+	tools, ok := resultData["tools"].([]map[string]any)
+	if !ok {
+		t.Fatal("Expected tools to be a slice of maps")
+	}
+	if len(tools) != 3 {
+		t.Fatalf("Expected 3 tools, got %d", len(tools))
+	}
+
+	for _, td := range tools {
+		switch td["name"] {
+		case "with_ann":
+			ann, ok := td["annotations"].(map[string]any)
+			if !ok {
+				t.Errorf("with_ann.annotations missing or wrong type: %T (%v)", td["annotations"], td["annotations"])
+				continue
+			}
+			if ann["title"] != "Annotated" {
+				t.Errorf("with_ann.annotations.title = %v, want %q", ann["title"], "Annotated")
+			}
+			if ann["readOnlyHint"] != true {
+				t.Errorf("with_ann.annotations.readOnlyHint = %v, want true", ann["readOnlyHint"])
+			}
+			// Other fields should be omitted (not present in map).
+			for _, k := range []string{"destructiveHint", "idempotentHint", "openWorldHint"} {
+				if _, present := ann[k]; present {
+					t.Errorf("with_ann.annotations.%s should be omitted, got %v", k, ann[k])
+				}
+			}
+		case "no_ann":
+			if _, present := td["annotations"]; present {
+				t.Errorf("no_ann should omit annotations key, got %v", td["annotations"])
+			}
+		case "empty_ann":
+			ann, ok := td["annotations"].(map[string]any)
+			if !ok {
+				t.Errorf("empty_ann.annotations missing or wrong type: %T (%v)", td["annotations"], td["annotations"])
+				continue
+			}
+			if len(ann) != 0 {
+				t.Errorf("empty_ann.annotations should be empty map, got %d keys: %v", len(ann), ann)
+			}
+		}
+	}
+}
+
+// TestMcpToolsListResponseAnnotationsAllFields verifies wire format when all
+// five MCP-spec annotation fields are populated, including exact camelCase
+// JSON key naming.
+func TestMcpToolsListResponseAnnotationsAllFields(t *testing.T) {
+	ctx, cancel := setupMcpTestContext(t, 5*time.Second)
+	defer cancel()
+
+	title := "Full"
+	readOnly := true
+	destructive := false
+	idempotent := true
+	openWorld := false
+
+	server := newMockMcpServer("test", "1.0.0")
+	server.tools = []McpToolDefinition{
+		{
+			Name:        "full",
+			Description: "All fields set",
+			InputSchema: map[string]any{"type": "object"},
+			Annotations: &ToolAnnotations{
+				Title:           &title,
+				ReadOnlyHint:    &readOnly,
+				DestructiveHint: &destructive,
+				IdempotentHint:  &idempotent,
+				OpenWorldHint:   &openWorld,
+			},
+		},
+	}
+
+	p := NewProtocol(newMcpMockTransport(), WithSdkMcpServers(map[string]McpServer{"test": server}))
+
+	msg := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+	result, err := p.routeMcpMethod(ctx, server, msg)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	resultData, ok := result["result"].(map[string]any)
+	if !ok {
+		t.Fatal("Expected result to be a map")
+	}
+	tools, ok := resultData["tools"].([]map[string]any)
+	if !ok {
+		t.Fatal("Expected tools to be a slice of maps")
+	}
+	ann, ok := tools[0]["annotations"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected annotations map, got %T (%v)", tools[0]["annotations"], tools[0]["annotations"])
+	}
+
+	wantKeys := map[string]any{
+		"title":           "Full",
+		"readOnlyHint":    true,
+		"destructiveHint": false,
+		"idempotentHint":  true,
+		"openWorldHint":   false,
+	}
+	for k, want := range wantKeys {
+		if got := ann[k]; got != want {
+			t.Errorf("annotations[%q] = %v (%T), want %v", k, got, got, want)
+		}
+	}
+	if len(ann) != len(wantKeys) {
+		t.Errorf("annotations has %d keys (%v), want exactly %d (%v)", len(ann), ann, len(wantKeys), wantKeys)
 	}
 }
 
@@ -437,10 +597,6 @@ func TestWithSdkMcpServers(t *testing.T) {
 	}
 }
 
-// =============================================================================
-// Mock Types
-// =============================================================================
-
 // mockMcpServer implements McpServer for testing.
 type mockMcpServer struct {
 	mu         sync.RWMutex
@@ -522,10 +678,6 @@ func (m *mcpMockTransport) Read(_ context.Context) <-chan []byte {
 func (m *mcpMockTransport) Close() error {
 	return nil
 }
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
 
 // setupMcpTestContext creates a context with timeout for MCP tests.
 func setupMcpTestContext(t *testing.T, timeout time.Duration) (context.Context, context.CancelFunc) {

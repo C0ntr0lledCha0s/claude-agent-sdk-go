@@ -57,9 +57,23 @@ type SdkPluginConfig = shared.SdkPluginConfig
 // OutputFormat specifies the format for structured output.
 type OutputFormat = shared.OutputFormat
 
-// =============================================================================
-// Permission Callback Types (Issue #8)
-// =============================================================================
+// EffortLevel controls how many tokens Claude spends per response.
+type EffortLevel = shared.EffortLevel
+
+// ThinkingConfig controls extended thinking (see WithThinking).
+type ThinkingConfig = shared.ThinkingConfig
+
+// ThinkingConfigAdaptive lets the model decide how much to think.
+type ThinkingConfigAdaptive = shared.ThinkingConfigAdaptive
+
+// ThinkingConfigEnabled sets a fixed token budget for thinking.
+type ThinkingConfigEnabled = shared.ThinkingConfigEnabled
+
+// ThinkingConfigDisabled turns thinking off.
+type ThinkingConfigDisabled = shared.ThinkingConfigDisabled
+
+// ThinkingDisplay controls how the CLI returns thinking content.
+type ThinkingDisplay = shared.ThinkingDisplay
 
 // CanUseToolCallback is invoked when CLI requests permission to use a tool.
 // The callback receives tool name, input parameters, and permission context.
@@ -107,6 +121,13 @@ const (
 	SettingSourceProject            = shared.SettingSourceProject
 	SettingSourceLocal              = shared.SettingSourceLocal
 	SdkPluginTypeLocal              = shared.SdkPluginTypeLocal
+	EffortLow                       = shared.EffortLow
+	EffortMedium                    = shared.EffortMedium
+	EffortHigh                      = shared.EffortHigh
+	EffortXHigh                     = shared.EffortXHigh
+	EffortMax                       = shared.EffortMax
+	ThinkingDisplaySummarized       = shared.ThinkingDisplaySummarized
+	ThinkingDisplayOmitted          = shared.ThinkingDisplayOmitted
 )
 
 // Permission update type constants
@@ -186,6 +207,16 @@ func WithFallbackModel(model string) Option {
 	}
 }
 
+// WithEffort sets the effort level (--effort), controlling how many tokens
+// Claude spends per response. Known levels are EffortLow..EffortMax, but any
+// value is passed through to the CLI to tolerate future levels.
+func WithEffort(effort EffortLevel) Option {
+	return func(o *Options) {
+		s := string(effort)
+		o.Effort = &s
+	}
+}
+
 // WithMaxBudgetUSD sets the maximum budget in USD for API usage.
 func WithMaxBudgetUSD(budget float64) Option {
 	return func(o *Options) {
@@ -207,7 +238,18 @@ func WithMaxBufferSize(size int) Option {
 	}
 }
 
-// WithMaxThinkingTokens sets the maximum thinking tokens.
+// WithThinking sets the extended thinking mode (--thinking or
+// --max-thinking-tokens, plus --thinking-display). It takes precedence over
+// WithMaxThinkingTokens.
+func WithThinking(config ThinkingConfig) Option {
+	return func(o *Options) {
+		o.Thinking = config
+	}
+}
+
+// WithMaxThinkingTokens sets the maximum thinking tokens (--max-thinking-tokens).
+//
+// Deprecated: Use WithThinking with ThinkingConfigEnabled.
 func WithMaxThinkingTokens(tokens int) Option {
 	return func(o *Options) {
 		o.MaxThinkingTokens = tokens
@@ -239,6 +281,27 @@ func WithContinueConversation(continueConversation bool) Option {
 func WithResume(sessionID string) Option {
 	return func(o *Options) {
 		o.Resume = &sessionID
+	}
+}
+
+// WithResumeSessionAt loads a resumed session only up to and including the
+// message with this UUID. Use it with WithResume (and usually
+// WithForkSession) to branch from an earlier point in the conversation.
+// The UUID is usually an AssistantMessage UUID or a SessionMessage UUID.
+func WithResumeSessionAt(messageUUID string) Option {
+	return func(o *Options) {
+		o.ResumeSessionAt = &messageUUID
+	}
+}
+
+// WithResumeDropsTurn sets the UUID of the user prompt whose turn a
+// WithResumeSessionAt resume discards. The CLI then refuses the resume when
+// an entry after the cut point is not part of that turn. The error message
+// contains "Resume rejected by --resume-drops-turn:". Do not retry the same
+// request; resume without the cut instead.
+func WithResumeDropsTurn(messageUUID string) Option {
+	return func(o *Options) {
+		o.ResumeDropsTurn = &messageUUID
 	}
 }
 
@@ -308,9 +371,54 @@ func WithForkSession(fork bool) Option {
 
 // WithSettingSources sets which settings sources to load.
 // Valid sources are SettingSourceUser, SettingSourceProject, and SettingSourceLocal.
+// Without this option the CLI loads its default sources (user, project and
+// local), which includes CLAUDE.md. Call it with no arguments to load no
+// filesystem settings.
 func WithSettingSources(sources ...SettingSource) Option {
 	return func(o *Options) {
-		o.SettingSources = sources
+		// Copy so that no arguments gives a non-nil empty list (isolation).
+		o.SettingSources = append([]SettingSource{}, sources...)
+	}
+}
+
+// SkillsAll is the sentinel value for enabling every discovered Skill.
+// Passing this to WithSkills enables all Skills found on the filesystem.
+const SkillsAll = shared.SkillsAll
+
+// WithSkills sets the Skills configuration directly.
+// Accepts the string "all" (use SkillsAll) to enable every discovered Skill,
+// a []string of Skill names to enable only those, or []string{} to disable all.
+// When set, SettingSources defaults to [user, project] if unset so the CLI
+// discovers installed Skills. Mirrors the Python SDK's skills option.
+func WithSkills(skills any) Option {
+	return func(o *Options) {
+		o.Skills = skills
+	}
+}
+
+// WithSkillsAll enables every discovered Skill in the session.
+func WithSkillsAll() Option {
+	return func(o *Options) {
+		o.Skills = SkillsAll
+	}
+}
+
+// WithSkillsList enables only the named Skills.
+// Names match the name field in SKILL.md or the Skill's directory name.
+// Use "plugin:skill" for plugin-provided Skills.
+func WithSkillsList(names ...string) Option {
+	return func(o *Options) {
+		// Always store a non-nil slice so callers can distinguish from unset.
+		list := make([]string, len(names))
+		copy(list, names)
+		o.Skills = list
+	}
+}
+
+// WithSkillsDisabled disables all Skills in the session.
+func WithSkillsDisabled() Option {
+	return func(o *Options) {
+		o.Skills = []string{}
 	}
 }
 
@@ -514,7 +622,6 @@ func WithDebugDisabled() Option {
 // Lines are stripped of trailing whitespace before being passed to the callback.
 // This takes precedence over WithDebugWriter if both are set.
 // Callback panics are silently recovered to prevent crashing the SDK.
-// Matches Python SDK's stderr callback behavior.
 func WithStderrCallback(callback func(string)) Option {
 	return func(o *Options) {
 		o.StderrCallback = callback
@@ -563,14 +670,9 @@ func WithPartialStreaming() Option {
 	return WithIncludePartialMessages(true)
 }
 
-// =============================================================================
-// File Checkpointing Options (Issue #32)
-// =============================================================================
-
 // WithEnableFileCheckpointing enables or disables file checkpointing.
 // When enabled, file changes are tracked during the session and can be
 // rewound to their state at any user message using Client.RewindFiles().
-// Matches Python SDK's enable_file_checkpointing option.
 func WithEnableFileCheckpointing(enable bool) Option {
 	return func(o *Options) {
 		o.EnableFileCheckpointing = enable
@@ -583,10 +685,6 @@ func WithEnableFileCheckpointing(enable bool) Option {
 func WithFileCheckpointing() Option {
 	return WithEnableFileCheckpointing(true)
 }
-
-// =============================================================================
-// Permission Callback Constructors and Options (Issue #8)
-// =============================================================================
 
 // NewPermissionResultAllow creates an Allow result with proper defaults.
 // Use this to permit tool execution.
@@ -626,7 +724,8 @@ var NewPermissionResultDeny = control.NewPermissionResultDeny
 //
 // The callback must be thread-safe as it may be invoked concurrently.
 // If no callback is set, all tool requests are denied (secure default).
-// Matches Python SDK's can_use_tool callback behavior.
+// Query and Client.Connect set PermissionPromptToolName to "stdio" so the CLI
+// asks this callback; combining it with another tool name is an error.
 func WithCanUseTool(callback CanUseToolCallback) Option {
 	return func(o *Options) {
 		// Handle nil callback explicitly
@@ -652,19 +751,17 @@ func WithCanUseTool(callback CanUseToolCallback) Option {
 	}
 }
 
-// =============================================================================
-// Hook Types (Issue #9)
-// =============================================================================
-
 // HookEvent represents lifecycle events that can trigger hooks.
 type HookEvent = control.HookEvent
 
-// Hook event constants matching Python SDK exactly.
+// Hook event constants.
 const (
 	// HookEventPreToolUse is triggered before a tool is executed.
 	HookEventPreToolUse = control.HookEventPreToolUse
 	// HookEventPostToolUse is triggered after a tool is executed.
 	HookEventPostToolUse = control.HookEventPostToolUse
+	// HookEventPostToolUseFailure is triggered after a tool execution fails.
+	HookEventPostToolUseFailure = control.HookEventPostToolUseFailure
 	// HookEventUserPromptSubmit is triggered when a user submits a prompt.
 	HookEventUserPromptSubmit = control.HookEventUserPromptSubmit
 	// HookEventStop is triggered when the session is stopping.
@@ -673,6 +770,12 @@ const (
 	HookEventSubagentStop = control.HookEventSubagentStop
 	// HookEventPreCompact is triggered before context compaction.
 	HookEventPreCompact = control.HookEventPreCompact
+	// HookEventNotification is triggered when the CLI emits a notification.
+	HookEventNotification = control.HookEventNotification
+	// HookEventSubagentStart is triggered when a subagent starts.
+	HookEventSubagentStart = control.HookEventSubagentStart
+	// HookEventPermissionRequest is triggered when a permission is requested.
+	HookEventPermissionRequest = control.HookEventPermissionRequest
 )
 
 // HookCallback is the function signature for hook callbacks.
@@ -698,6 +801,8 @@ type (
 	PreToolUseHookInput = control.PreToolUseHookInput
 	// PostToolUseHookInput is the input for PostToolUse hook events.
 	PostToolUseHookInput = control.PostToolUseHookInput
+	// PostToolUseFailureHookInput is the input for PostToolUseFailure hook events.
+	PostToolUseFailureHookInput = control.PostToolUseFailureHookInput
 	// UserPromptSubmitHookInput is the input for UserPromptSubmit hook events.
 	UserPromptSubmitHookInput = control.UserPromptSubmitHookInput
 	// StopHookInput is the input for Stop hook events.
@@ -706,6 +811,12 @@ type (
 	SubagentStopHookInput = control.SubagentStopHookInput
 	// PreCompactHookInput is the input for PreCompact hook events.
 	PreCompactHookInput = control.PreCompactHookInput
+	// NotificationHookInput is the input for Notification hook events.
+	NotificationHookInput = control.NotificationHookInput
+	// SubagentStartHookInput is the input for SubagentStart hook events.
+	SubagentStartHookInput = control.SubagentStartHookInput
+	// PermissionRequestHookInput is the input for PermissionRequest hook events.
+	PermissionRequestHookInput = control.PermissionRequestHookInput
 )
 
 // PreToolUseHookSpecificOutput and related types contain hook-specific output fields.
@@ -714,13 +825,17 @@ type (
 	PreToolUseHookSpecificOutput = control.PreToolUseHookSpecificOutput
 	// PostToolUseHookSpecificOutput contains PostToolUse-specific output fields.
 	PostToolUseHookSpecificOutput = control.PostToolUseHookSpecificOutput
+	// PostToolUseFailureHookSpecificOutput contains PostToolUseFailure-specific output fields.
+	PostToolUseFailureHookSpecificOutput = control.PostToolUseFailureHookSpecificOutput
 	// UserPromptSubmitHookSpecificOutput contains UserPromptSubmit-specific output fields.
 	UserPromptSubmitHookSpecificOutput = control.UserPromptSubmitHookSpecificOutput
+	// NotificationHookSpecificOutput contains Notification-specific output fields.
+	NotificationHookSpecificOutput = control.NotificationHookSpecificOutput
+	// SubagentStartHookSpecificOutput contains SubagentStart-specific output fields.
+	SubagentStartHookSpecificOutput = control.SubagentStartHookSpecificOutput
+	// PermissionRequestHookSpecificOutput contains PermissionRequest-specific output fields.
+	PermissionRequestHookSpecificOutput = control.PermissionRequestHookSpecificOutput
 )
-
-// =============================================================================
-// Hook Options (Issue #9)
-// =============================================================================
 
 // WithHooks sets the complete hook configuration for lifecycle events.
 // This replaces any previously configured hooks.

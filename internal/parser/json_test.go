@@ -14,7 +14,7 @@ const testResultAnswer42 = "The answer is 42"
 const validSystemStatusJSON = `{"type": "system", "subtype": "status"}`
 
 // TestParseValidMessages tests parsing of valid message types
-func TestParseValidMessages(t *testing.T) {
+func TestParseValidMessages(t *testing.T) { //nolint:gocyclo
 	tests := []struct {
 		name         string
 		data         map[string]any
@@ -42,7 +42,7 @@ func TestParseValidMessages(t *testing.T) {
 			},
 			expectedType: shared.MessageTypeUser,
 		},
-		// Issue #24: UUID and ParentToolUseID field tests
+		// UUID and ParentToolUseID field tests
 		{
 			name: "user_message_with_uuid",
 			data: map[string]any{
@@ -123,16 +123,102 @@ func TestParseValidMessages(t *testing.T) {
 				},
 			},
 			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.ParentToolUseID != nil {
+					t.Errorf("expected ParentToolUseID nil, got %v", am.ParentToolUseID)
+				}
+				if am.Usage != nil {
+					t.Errorf("expected Usage nil when absent, got %v", am.Usage)
+				}
+			},
 		},
-		// Issue #23: AssistantMessage error field tests
 		{
-			name: "assistant_message_with_rate_limit_error",
+			name: "assistant_message_with_usage",
 			data: map[string]any{
 				"type": "assistant",
 				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "Hi"}},
+					"model":   "claude-3-sonnet",
+					"usage": map[string]any{
+						"input_tokens":                float64(2),
+						"output_tokens":               float64(4),
+						"cache_creation_input_tokens": float64(8778),
+						"cache_read_input_tokens":     float64(9693),
+					},
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.Usage == nil {
+					t.Fatal("expected Usage to be set")
+				}
+				usage := *am.Usage
+				if usage["input_tokens"] != float64(2) {
+					t.Errorf("expected input_tokens 2, got %v", usage["input_tokens"])
+				}
+				if usage["cache_read_input_tokens"] != float64(9693) {
+					t.Errorf("expected cache_read_input_tokens 9693, got %v", usage["cache_read_input_tokens"])
+				}
+			},
+		},
+		{
+			// Regression guard: usage lives nested under "message", not at the
+			// top level of the event (unlike ResultMessage). A top-level usage
+			// key must NOT populate the field.
+			name: "assistant_message_with_top_level_usage_ignored",
+			data: map[string]any{
+				"type":  "assistant",
+				"usage": map[string]any{"input_tokens": float64(999)},
+				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "Hi"}},
+					"model":   "claude-3-sonnet",
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.Usage != nil {
+					t.Errorf("expected Usage nil when only top-level usage present, got %v", am.Usage)
+				}
+			},
+		},
+		{
+			name: "assistant_message_with_parent_tool_use_id",
+			data: map[string]any{
+				"type":               "assistant",
+				"parent_tool_use_id": "tool-abc",
+				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "Subagent reply"}},
+					"model":   "claude-3-sonnet",
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.ParentToolUseID == nil || *am.ParentToolUseID != "tool-abc" {
+					t.Errorf("expected ParentToolUseID 'tool-abc', got %v", am.ParentToolUseID)
+				}
+				if am.GetParentToolUseID() != "tool-abc" {
+					t.Errorf("expected GetParentToolUseID() 'tool-abc', got %q", am.GetParentToolUseID())
+				}
+			},
+		},
+		// error field is at the top level of the event, not nested inside data["message"].
+		// CLI wire format: {"type":"assistant","error":"rate_limit","message":{...}}.
+		{
+			name: "assistant_message_with_rate_limit_error",
+			data: map[string]any{
+				"type":  "assistant",
+				"error": "rate_limit",
+				"message": map[string]any{
 					"content": []any{map[string]any{"type": "text", "text": "Rate limited"}},
 					"model":   "claude-3-sonnet",
-					"error":   "rate_limit",
 				},
 			},
 			expectedType: shared.MessageTypeAssistant,
@@ -153,11 +239,11 @@ func TestParseValidMessages(t *testing.T) {
 		{
 			name: "assistant_message_with_auth_error",
 			data: map[string]any{
-				"type": "assistant",
+				"type":  "assistant",
+				"error": "authentication_failed",
 				"message": map[string]any{
 					"content": []any{map[string]any{"type": "text", "text": "Auth failed"}},
 					"model":   "claude-3-sonnet",
-					"error":   "authentication_failed",
 				},
 			},
 			expectedType: shared.MessageTypeAssistant,
@@ -175,6 +261,130 @@ func TestParseValidMessages(t *testing.T) {
 				}
 				if am.IsRateLimited() {
 					t.Error("expected IsRateLimited() to return false for auth error")
+				}
+			},
+		},
+		{
+			name: "assistant_message_with_billing_error",
+			data: map[string]any{
+				"type":  "assistant",
+				"error": "billing_error",
+				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "Billing error"}},
+					"model":   "claude-3-sonnet",
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.Error == nil {
+					t.Fatal("expected Error to be set, got nil")
+				}
+				if *am.Error != shared.AssistantMessageErrorBilling {
+					t.Errorf("expected Error 'billing_error', got %v", *am.Error)
+				}
+				if !am.HasError() {
+					t.Error("expected HasError() to return true")
+				}
+				if am.IsRateLimited() {
+					t.Error("expected IsRateLimited() to return false for billing error")
+				}
+			},
+		},
+		{
+			name: "assistant_message_with_server_error",
+			data: map[string]any{
+				"type":  "assistant",
+				"error": "server_error",
+				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "Server error"}},
+					"model":   "claude-3-sonnet",
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.Error == nil {
+					t.Fatal("expected Error to be set, got nil")
+				}
+				if *am.Error != shared.AssistantMessageErrorServer {
+					t.Errorf("expected Error 'server_error', got %v", *am.Error)
+				}
+				if !am.HasError() {
+					t.Error("expected HasError() to return true")
+				}
+			},
+		},
+		{
+			name: "assistant_message_with_invalid_request_error",
+			data: map[string]any{
+				"type":  "assistant",
+				"error": "invalid_request",
+				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "Invalid request"}},
+					"model":   "claude-3-sonnet",
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.Error == nil {
+					t.Fatal("expected Error to be set, got nil")
+				}
+				if *am.Error != shared.AssistantMessageErrorInvalidRequest {
+					t.Errorf("expected Error 'invalid_request', got %v", *am.Error)
+				}
+				if !am.HasError() {
+					t.Error("expected HasError() to return true")
+				}
+			},
+		},
+		{
+			name: "assistant_message_with_unknown_error",
+			data: map[string]any{
+				"type":  "assistant",
+				"error": "unknown",
+				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "Unknown error"}},
+					"model":   "claude-3-sonnet",
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.Error == nil {
+					t.Fatal("expected Error to be set, got nil")
+				}
+				if *am.Error != shared.AssistantMessageErrorUnknown {
+					t.Errorf("expected Error 'unknown', got %v", *am.Error)
+				}
+				if !am.HasError() {
+					t.Error("expected HasError() to return true")
+				}
+			},
+		},
+		{
+			name: "assistant_message_error_in_nested_message_ignored",
+			// Regression: error inside data["message"] must NOT be picked up.
+			// Only top-level data["error"] is the wire format.
+			data: map[string]any{
+				"type": "assistant",
+				"message": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "ok"}},
+					"model":   "claude-3-sonnet",
+					"error":   "rate_limit",
+				},
+			},
+			expectedType: shared.MessageTypeAssistant,
+			validate: func(t *testing.T, msg shared.Message) {
+				t.Helper()
+				am := msg.(*shared.AssistantMessage)
+				if am.Error != nil {
+					t.Errorf("expected Error nil when error is nested in message object, got %v", *am.Error)
 				}
 			},
 		},
@@ -232,8 +442,7 @@ func TestParseValidMessages(t *testing.T) {
 	}
 }
 
-// Issue #98: TestParseUserMessageToolUseResult tests tool_use_result field parsing
-// Python SDK v0.1.22 parity (PR #495)
+// TestParseUserMessageToolUseResult tests tool_use_result field parsing.
 func TestParseUserMessageToolUseResult(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -378,11 +587,6 @@ func TestParseErrors(t *testing.T) {
 			expectError: "missing or invalid type field",
 		},
 		{
-			name:        "unknown_message_type",
-			data:        map[string]any{"type": "unknown_type", "content": "test"},
-			expectError: "unknown message type: unknown_type",
-		},
-		{
 			name:        "user_message_missing_message_field",
 			data:        map[string]any{"type": "user"},
 			expectError: "user message missing message field",
@@ -446,8 +650,28 @@ func TestBufferManagement(t *testing.T) {
 		largeString := strings.Repeat("x", MaxBufferSize+1000)
 
 		_, err := parser.processJSONLine(largeString)
-		assertBufferOverflowError(t, err)
+		assertBufferOverflowError(t, err, MaxBufferSize)
 		assertBufferEmpty(t, parser)
+	})
+
+	// Python test_buffer_size_option: the custom limit applies and is named in the error.
+	t.Run("custom_size_over_limit", func(t *testing.T) {
+		parser := NewWithSize(512)
+		_, err := parser.processJSONLine(`{"data": "` + strings.Repeat("x", 512+10))
+		assertBufferOverflowError(t, err, 512)
+		assertBufferEmpty(t, parser)
+	})
+
+	t.Run("custom_size_equal_to_limit", func(t *testing.T) {
+		line := `{"type":"system","subtype":"status","data":"` + strings.Repeat("x", 100) + `"}`
+		parser := NewWithSize(len(line))
+		msg, err := parser.processJSONLine(line)
+		if err != nil {
+			t.Fatalf("line of exactly the limit: error = %v, want nil", err)
+		}
+		if msg == nil {
+			t.Fatal("line of exactly the limit: got nil message")
+		}
 	})
 
 	t.Run("buffer_reset_on_success", func(t *testing.T) {
@@ -666,6 +890,101 @@ func TestEmptyAndWhitespaceHandling(t *testing.T) {
 	}
 }
 
+// TestParseRateLimitEventMessage covers the rate_limit_event heartbeat the
+// CLI emits per session. See issue #126.
+func TestParseRateLimitEventMessage(t *testing.T) {
+	parser := New()
+
+	t.Run("allowed heartbeat", func(t *testing.T) {
+		msg, err := parser.ParseMessage(map[string]any{
+			"type": "rate_limit_event",
+			"rate_limit_info": map[string]any{
+				"status":          "allowed",
+				"resetsAt":        float64(1778598000),
+				"rateLimitType":   "five_hour",
+				"overageStatus":   "allowed",
+				"overageResetsAt": float64(1780272000),
+				"isUsingOverage":  false,
+			},
+			"uuid":       "91eb2b60-b575-4977-a4cb-1733e0939c1b",
+			"session_id": "cca23008-d827-4b92-a8bc-d6f5efe5a03e",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		rl, ok := msg.(*shared.RateLimitEventMessage)
+		if !ok {
+			t.Fatalf("expected *RateLimitEventMessage, got %T", msg)
+		}
+		if rl.Type() != shared.MessageTypeRateLimitEvent {
+			t.Errorf("Type() = %q, want %q", rl.Type(), shared.MessageTypeRateLimitEvent)
+		}
+		if !rl.IsAllowed() {
+			t.Error("IsAllowed() = false, want true")
+		}
+		if rl.RateLimitInfo.RateLimitType != "five_hour" {
+			t.Errorf("RateLimitType = %q, want %q", rl.RateLimitInfo.RateLimitType, "five_hour")
+		}
+		if rl.RateLimitInfo.ResetsAt != 1778598000 {
+			t.Errorf("ResetsAt = %d, want 1778598000", rl.RateLimitInfo.ResetsAt)
+		}
+		if rl.UUID != "91eb2b60-b575-4977-a4cb-1733e0939c1b" {
+			t.Errorf("UUID = %q", rl.UUID)
+		}
+		if rl.SessionID != "cca23008-d827-4b92-a8bc-d6f5efe5a03e" {
+			t.Errorf("SessionID = %q", rl.SessionID)
+		}
+	})
+
+	t.Run("non-allowed status", func(t *testing.T) {
+		msg, err := parser.ParseMessage(map[string]any{
+			"type": "rate_limit_event",
+			"rate_limit_info": map[string]any{
+				"status":        "blocked",
+				"resetsAt":      float64(1778600000),
+				"rateLimitType": "five_hour",
+			},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		rl := msg.(*shared.RateLimitEventMessage)
+		if rl.IsAllowed() {
+			t.Error("IsAllowed() = true for status=blocked")
+		}
+		if rl.RateLimitInfo.Status != "blocked" {
+			t.Errorf("Status = %q, want %q", rl.RateLimitInfo.Status, "blocked")
+		}
+	})
+
+	t.Run("missing rate_limit_info is parse error", func(t *testing.T) {
+		_, err := parser.ParseMessage(map[string]any{
+			"type": "rate_limit_event",
+		})
+		if err == nil {
+			t.Fatal("expected error for missing rate_limit_info, got nil")
+		}
+	})
+
+	t.Run("missing optional uuid and session_id is ok", func(t *testing.T) {
+		msg, err := parser.ParseMessage(map[string]any{
+			"type": "rate_limit_event",
+			"rate_limit_info": map[string]any{
+				"status":        "allowed",
+				"resetsAt":      float64(1),
+				"rateLimitType": "five_hour",
+			},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		rl := msg.(*shared.RateLimitEventMessage)
+		if rl.UUID != "" || rl.SessionID != "" {
+			t.Errorf("expected empty optional fields, got uuid=%q session_id=%q", rl.UUID, rl.SessionID)
+		}
+	})
+}
+
 // TestParseMessages tests the convenience function
 func TestParseMessages(t *testing.T) {
 	// Test successful parsing
@@ -681,12 +1000,12 @@ func TestParseMessages(t *testing.T) {
 	// Test error handling
 	errorLines := []string{
 		`{"type": "user", "message": {"content": "Valid"}}`,
-		`{"type": "invalid"}`, // This should cause an error
+		`{"type": "user"}`, // missing message field
 	}
 
 	_, err = ParseMessages(errorLines)
 	if err == nil {
-		t.Error("Expected error for invalid message type")
+		t.Fatal("Expected error for user message without message field")
 	}
 	if !strings.Contains(err.Error(), "error parsing line 1") {
 		t.Errorf("Expected line number in error, got: %v", err)
@@ -754,7 +1073,7 @@ func TestParseErrorConditions(t *testing.T) {
 				"type": "assistant",
 				"message": map[string]any{
 					"content": []any{
-						map[string]any{"type": "unknown_block"},
+						map[string]any{"type": "text"},
 					},
 					"model": "claude-3",
 				},
@@ -951,11 +1270,6 @@ func TestContentBlockErrorConditions(t *testing.T) {
 			expectError: "content block missing type field",
 		},
 		{
-			name:        "unknown_block_type",
-			blockData:   map[string]any{"type": "unknown_type"},
-			expectError: "unknown content block type: unknown_type",
-		},
-		{
 			name:        "text_block_missing_text",
 			blockData:   map[string]any{"type": "text"},
 			expectError: "text block missing text field",
@@ -1064,7 +1378,7 @@ func TestProcessLineEdgeCases(t *testing.T) {
 	parser := setupParserTest(t)
 
 	// Test line with content block parse error
-	invalidBlockLine := `{"type": "user", "message": {"content": [{"type": "unknown_block"}]}}`
+	invalidBlockLine := `{"type": "user", "message": {"content": [{"type": "text"}]}}`
 	messages, err := parser.ProcessLine(invalidBlockLine)
 	if err == nil {
 		t.Error("Expected error for invalid content block")
@@ -1074,7 +1388,7 @@ func TestProcessLineEdgeCases(t *testing.T) {
 	}
 
 	// Test multiple lines with one having an error
-	mixedLine := `{"type": "system", "subtype": "ok"}` + "\n" + `{"type": "invalid"}`
+	mixedLine := `{"type": "system", "subtype": "ok"}` + "\n" + `{"type": "user"}`
 	messages2, err2 := parser.ProcessLine(mixedLine)
 	if err2 == nil {
 		t.Error("Expected error for second invalid message")
@@ -1085,7 +1399,195 @@ func TestProcessLineEdgeCases(t *testing.T) {
 	}
 }
 
+// TestParseMessageSkipsUnknownType tests that an unknown message type gives no message and no error.
+func TestParseMessageSkipsUnknownType(t *testing.T) {
+	parser := setupParserTest(t)
+
+	msg, err := parser.ParseMessage(map[string]any{"type": "future_type", "content": "test"})
+	assertNoParseError(t, err)
+	assertNoMessage(t, msg)
+}
+
+// TestProcessLineSkipsUnknownType tests that an unknown line does not stop the known lines around it.
+func TestProcessLineSkipsUnknownType(t *testing.T) {
+	parser := setupParserTest(t)
+
+	input := validSystemStatusJSON + "\n" +
+		`{"type": "future_type", "payload": {"a": 1}}` + "\n" +
+		`{"type": "user", "message": {"content": "hello"}}`
+	messages, err := parser.ProcessLine(input)
+	assertNoParseError(t, err)
+	assertMessageCount(t, messages, 2)
+	assertMessageType(t, messages[0], shared.MessageTypeSystem)
+	assertMessageType(t, messages[1], shared.MessageTypeUser)
+}
+
+// TestParseSkipsUnknownContentBlock tests that an unknown block is dropped and the known blocks stay.
+func TestParseSkipsUnknownContentBlock(t *testing.T) {
+	content := []any{
+		map[string]any{"type": "text", "text": "before"},
+		map[string]any{"type": "future_block", "data": "x"},
+		map[string]any{"type": "text", "text": "after"},
+	}
+
+	t.Run("assistant", func(t *testing.T) {
+		parser := setupParserTest(t)
+		msg, err := parser.ParseMessage(map[string]any{
+			"type":    "assistant",
+			"message": map[string]any{"model": "claude-test", "content": content},
+		})
+		assertParseSuccess(t, err, msg)
+		assistant, ok := msg.(*shared.AssistantMessage)
+		if !ok {
+			t.Fatalf("Expected *shared.AssistantMessage, got %T", msg)
+			return
+		}
+		assertTextBlocks(t, assistant.Content, "before", "after")
+	})
+
+	t.Run("user", func(t *testing.T) {
+		parser := setupParserTest(t)
+		msg, err := parser.ParseMessage(map[string]any{
+			"type":    "user",
+			"message": map[string]any{"content": content},
+		})
+		assertParseSuccess(t, err, msg)
+		user, ok := msg.(*shared.UserMessage)
+		if !ok {
+			t.Fatalf("Expected *shared.UserMessage, got %T", msg)
+			return
+		}
+		blocks, ok := user.Content.([]shared.ContentBlock)
+		if !ok {
+			t.Fatalf("Expected []shared.ContentBlock, got %T", user.Content)
+			return
+		}
+		assertTextBlocks(t, blocks, "before", "after")
+	})
+}
+
+// TestParseConversationResetMessage tests the conversation_reset message and its required fields.
+func TestParseConversationResetMessage(t *testing.T) {
+	full := map[string]any{
+		"type":                "conversation_reset",
+		"new_conversation_id": "conv-2",
+		"uuid":                "uuid-1",
+		"session_id":          "session-1",
+	}
+
+	parser := setupParserTest(t)
+	msg, err := parser.ParseMessage(full)
+	assertParseSuccess(t, err, msg)
+	reset, ok := msg.(*shared.ConversationResetMessage)
+	if !ok {
+		t.Fatalf("Expected *shared.ConversationResetMessage, got %T", msg)
+		return
+	}
+	assertMessageType(t, reset, shared.MessageTypeConversationReset)
+	if reset.NewConversationID != "conv-2" || reset.UUID != "uuid-1" || reset.SessionID != "session-1" {
+		t.Errorf("Unexpected fields: %+v", reset)
+	}
+
+	for _, field := range []string{"new_conversation_id", "uuid", "session_id"} {
+		t.Run("missing_"+field, func(t *testing.T) {
+			data := make(map[string]any, len(full))
+			for k, v := range full {
+				if k != field {
+					data[k] = v
+				}
+			}
+			_, err := setupParserTest(t).ParseMessage(data)
+			assertParseError(t, err, "conversation_reset message missing "+field+" field")
+		})
+	}
+}
+
+// TestParseServerToolBlocks tests server_tool_use and advisor_tool_result blocks.
+func TestParseServerToolBlocks(t *testing.T) {
+	parser := setupParserTest(t)
+	msg, err := parser.ParseMessage(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"model": "claude-test",
+			"content": []any{
+				map[string]any{
+					"type":  "server_tool_use",
+					"id":    "srvtoolu_1",
+					"name":  "advisor",
+					"input": map[string]any{"question": "q"},
+				},
+				map[string]any{
+					"type":        "advisor_tool_result",
+					"tool_use_id": "srvtoolu_1",
+					"content":     map[string]any{"type": "advisor_result", "text": "a"},
+				},
+			},
+		},
+	})
+	assertParseSuccess(t, err, msg)
+	assistant, ok := msg.(*shared.AssistantMessage)
+	if !ok || len(assistant.Content) != 2 {
+		t.Fatalf("Expected an assistant message with 2 blocks, got %#v", msg)
+		return
+	}
+
+	use, ok := assistant.Content[0].(*shared.ServerToolUseBlock)
+	if !ok {
+		t.Fatalf("Expected *shared.ServerToolUseBlock, got %T", assistant.Content[0])
+		return
+	}
+	if use.BlockType() != shared.ContentBlockTypeServerToolUse || use.ID != "srvtoolu_1" ||
+		use.Name != shared.ServerToolNameAdvisor || use.Input["question"] != "q" {
+		t.Errorf("Unexpected server tool use block: %+v", use)
+	}
+
+	result, ok := assistant.Content[1].(*shared.ServerToolResultBlock)
+	if !ok {
+		t.Fatalf("Expected *shared.ServerToolResultBlock, got %T", assistant.Content[1])
+		return
+	}
+	if result.BlockType() != shared.ContentBlockTypeAdvisorToolResult || result.ToolUseID != "srvtoolu_1" ||
+		result.Content["text"] != "a" {
+		t.Errorf("Unexpected server tool result block: %+v", result)
+	}
+}
+
+// TestParseServerToolBlockErrors tests that a missing required key gives a parse error.
+func TestParseServerToolBlockErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		block       map[string]any
+		expectError string
+	}{
+		{"use_missing_id", map[string]any{"type": "server_tool_use", "name": "advisor", "input": map[string]any{}}, "server_tool_use block missing id field"},
+		{"use_missing_name", map[string]any{"type": "server_tool_use", "id": "s1", "input": map[string]any{}}, "server_tool_use block missing name field"},
+		{"use_missing_input", map[string]any{"type": "server_tool_use", "id": "s1", "name": "advisor"}, "server_tool_use block missing input field"},
+		{"result_missing_tool_use_id", map[string]any{"type": "advisor_tool_result", "content": map[string]any{}}, "advisor_tool_result block missing tool_use_id field"},
+		{"result_missing_content", map[string]any{"type": "advisor_tool_result", "tool_use_id": "s1"}, "advisor_tool_result block missing content field"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := setupParserTest(t).parseContentBlock(test.block)
+			assertParseError(t, err, test.expectError)
+		})
+	}
+}
+
 // Mock and Helper Functions
+
+func assertTextBlocks(t *testing.T, blocks []shared.ContentBlock, want ...string) {
+	t.Helper()
+	if len(blocks) != len(want) {
+		t.Fatalf("Expected %d blocks, got %d: %#v", len(want), len(blocks), blocks)
+	}
+	for i, text := range want {
+		block, ok := blocks[i].(*shared.TextBlock)
+		if !ok || block.Text != text {
+			t.Errorf("Block %d: expected text %q, got %#v", i, text, blocks[i])
+		}
+	}
+}
 
 // setupParserTest creates a new parser for testing
 func setupParserTest(t *testing.T) *Parser {
@@ -1182,7 +1684,7 @@ func assertBufferNotEmpty(t *testing.T, parser *Parser) {
 	}
 }
 
-func assertBufferOverflowError(t *testing.T, err error) {
+func assertBufferOverflowError(t *testing.T, err error, limit int) {
 	t.Helper()
 	if err == nil {
 		t.Fatal("Expected buffer overflow error, got nil")
@@ -1190,9 +1692,11 @@ func assertBufferOverflowError(t *testing.T, err error) {
 	jsonDecodeErr := shared.AsJSONDecodeError(err)
 	if jsonDecodeErr == nil {
 		t.Fatalf("Expected JSONDecodeError, got %T", err)
+		return
 	}
-	if !strings.Contains(jsonDecodeErr.Error(), "buffer overflow") {
-		t.Errorf("Expected buffer overflow error, got %q", jsonDecodeErr.Error())
+	want := fmt.Sprintf("JSON message exceeded maximum buffer size of %d bytes", limit)
+	if !strings.Contains(jsonDecodeErr.Error(), want) {
+		t.Errorf("Expected %q in error, got %q", want, jsonDecodeErr.Error())
 	}
 }
 
@@ -1765,4 +2269,89 @@ func TestStreamEventErrorConditions(t *testing.T) {
 			assertParseError(t, err, test.expectError)
 		})
 	}
+}
+
+// TestResultMessageErrorsField tests the errors array field on ResultMessage.
+func TestResultMessageErrorsField(t *testing.T) {
+	parser := setupParserTest(t)
+
+	baseData := map[string]any{
+		"type":            "result",
+		"subtype":         "error",
+		"duration_ms":     0.0,
+		"duration_api_ms": 0.0,
+		"is_error":        true,
+		"num_turns":       0.0,
+		"session_id":      "s123",
+	}
+
+	t.Run("with_errors_array", func(t *testing.T) {
+		data := make(map[string]any)
+		for k, v := range baseData {
+			data[k] = v
+		}
+		data["errors"] = []any{
+			"No conversation found with session ID: abc-123",
+			"second error",
+		}
+
+		msg, err := parser.ParseMessage(data)
+		assertNoParseError(t, err)
+
+		resultMsg := msg.(*shared.ResultMessage)
+		if len(resultMsg.Errors) != 2 {
+			t.Fatalf("expected 2 errors, got %d", len(resultMsg.Errors))
+		}
+		if resultMsg.Errors[0] != "No conversation found with session ID: abc-123" {
+			t.Errorf("unexpected first error: %s", resultMsg.Errors[0])
+		}
+		if resultMsg.Errors[1] != "second error" {
+			t.Errorf("unexpected second error: %s", resultMsg.Errors[1])
+		}
+	})
+
+	t.Run("without_errors_array", func(t *testing.T) {
+		msg, err := parser.ParseMessage(baseData)
+		assertNoParseError(t, err)
+
+		resultMsg := msg.(*shared.ResultMessage)
+		if len(resultMsg.Errors) != 0 {
+			t.Errorf("expected empty errors, got %v", resultMsg.Errors)
+		}
+	})
+
+	t.Run("with_empty_errors_array", func(t *testing.T) {
+		data := make(map[string]any)
+		for k, v := range baseData {
+			data[k] = v
+		}
+		data["errors"] = []any{}
+
+		msg, err := parser.ParseMessage(data)
+		assertNoParseError(t, err)
+
+		resultMsg := msg.(*shared.ResultMessage)
+		if len(resultMsg.Errors) != 0 {
+			t.Errorf("expected empty errors, got %v", resultMsg.Errors)
+		}
+	})
+
+	t.Run("with_non_string_errors_ignored", func(t *testing.T) {
+		data := make(map[string]any)
+		for k, v := range baseData {
+			data[k] = v
+		}
+		data["errors"] = []any{"valid error", 123, true}
+
+		msg, err := parser.ParseMessage(data)
+		assertNoParseError(t, err)
+
+		resultMsg := msg.(*shared.ResultMessage)
+		if len(resultMsg.Errors) != 1 {
+			t.Fatalf("expected 1 error (non-strings skipped), got %d", len(resultMsg.Errors))
+		}
+		if resultMsg.Errors[0] != "valid error" {
+			t.Errorf("unexpected error: %s", resultMsg.Errors[0])
+		}
+	})
 }

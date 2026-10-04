@@ -18,17 +18,20 @@ control/
 ├── permissions.go         # Permission callback handling, response building
 ├── types.go               # Request/Response types, Initialize handshake
 ├── types_hook.go          # Hook event types, HookMatcher, HookCallback
-├── protocol_test.go       # Protocol unit tests
-├── protocol_bench_test.go # Performance benchmarks
-├── hooks_test.go          # Hook system tests
-├── mcp_test.go            # MCP server tests
-└── types_hook_test.go     # Hook type tests
+├── protocol_test.go          # Protocol unit tests
+├── close_test.go             # Close wakes pending requests, no request after Close
+├── fail_pending_test.go      # FailPendingRequests (stream ended with an error)
+├── protocol_bench_test.go    # Performance benchmarks
+├── hooks_test.go             # Hook system tests
+├── mcp_test.go               # MCP server tests
+├── types_hook_test.go        # Hook type tests
+└── initialize_agents_test.go # Agents field in InitializeRequest tests
 ```
 
 **Protocol Flow**:
 1. `Initialize()`: Handshake with CLI, negotiate capabilities
 2. `SendControlRequest()`: Send JSON-RPC style requests with correlation IDs
-3. `HandleIncomingMessage()`: Route responses to pending requests
+3. `HandleIncomingMessage()`: Route responses to pending requests; read loops call `HandleIncomingMessageAsync()`, which runs each incoming control request on its own goroutine with a per-request ctx tracked in `inflightRequests` (cancelled by `Close()` without waiting). Handler errors and panics send an error `control_response` (unknown subtypes too); a cancelled handler writes nothing (`writeControlResponse` checks ctx)
 4. Hook/Permission callbacks: Invoked on tool use events (hooks.go, permissions.go)
 5. MCP messages: Route to SDK MCP servers (mcp.go)
 
@@ -37,10 +40,27 @@ control/
 <!-- AUTO-MANAGED: conventions -->
 ## Module-Specific Conventions
 
+- Initialize result: `Initialize()` keeps the whole response map in `initResult` (Python `Query._initialization_result`); `InitializationResult()` returns a deep copy via `copyJSONValue`, nil before the handshake; `InitializeResponse` still decodes only `supported_commands`
 - Request correlation: Use unique request IDs for response matching
 - Thread safety: All state access protected by mutex
 - Timeout handling: Default 60s init timeout, configurable via `WithInitTimeout`
 - Hook registration: `RegisterHook()` returns callback ID for later removal
+- Close and pending requests: `Close()` closes `closedCh`, which wakes every `SendControlRequest` waiting for its response with `ErrProtocolClosed`; a request sent after `Close()` returns `ErrProtocolClosed` without being written (checked under `p.mu` where the request is registered, so no request can register after Close); Python only fails pending requests when its reader ends with an error, so this is a Go lifecycle guarantee
+- Stream-end failure: `FailPendingRequests(err)` (called by `Transport.endStreamWithError` when the CLI exits non-zero, a stdout line exceeds the buffer limit, or the stdout scanner fails; Python `_read_messages` sets the reader's error on every pending request) delivers `err` to each waiting `SendControlRequest` through its response channel (`Response.failure`, unexported); it does nothing before `initialized`, because `HandleControlInitErr` already fails a request waiting on the handshake
+- Init error channel: `initErrChan chan error` (buffered, size 1) in Protocol struct; `HandleControlInitErr()` sends non-blocking to unblock `SendControlRequest()` when CLI fails before handshake (e.g., invalid session ID); reads `p.initialized` under lock first and is a no-op after `Initialize()` succeeds - prevents the post-init stdoutDone watcher from poisoning `initErrChan` for later `SendControlRequest` calls (e.g. `SetModel`/`GetMcpStatus` on a long-lived client)
+- Constructor pattern: `NewGetMcpStatusRequest()` sets `Subtype: SubtypeGetMcpStatus`; follows same pattern as `NewPermissionResultAllow/Deny`; use constructors for request types with fixed subtype values
+- SubtypeGetMcpStatus = `"mcp_status"` (wire value from Python SDK query.py); included in parity table in `testSubtypeConstants`
+- McpServerConfigType constants: `McpServerConfigTypeStdio/SSE/HTTP/SDK/ClaudeAI` discriminate `McpServerStatusConfig.Type`
+- McpServerStatus conditional fields: `ServerInfo` non-nil only when connected; `Error` non-nil only when failed; `Tools` populated only when connected
+- Agents on initialize (Python SDK PR #468): `InitializeRequest.Agents map[string]any json:"agents,omitempty"` carries agent definitions over the control protocol instead of the deprecated `--agents` CLI flag, bypassing platform ARG_MAX limits. Configure via `WithAgents(map[string]any) ProtocolOption`. Type is `map[string]any` (not `map[string]shared.AgentDefinition`) so the `control` package stays free of any `shared` dependency - subprocess does the conversion in `agentsToMap`. `Initialize()` always sends the request now (the old gate on hooks/permissions/MCP was removed) so agents always flow on every connection.
+- Hook event count: 10 as of Python SDK PR #545 (added `Notification`, `SubagentStart`, `PermissionRequest` to the 7 from PR #535); const block order in types_hook.go: PreToolUse, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, SubagentStop, PreCompact, Notification, SubagentStart, PermissionRequest
+- New hook input structs (PR #545): `NotificationHookInput` (Message, Title *string omitempty, NotificationType); `SubagentStartHookInput` (AgentID, AgentType); `PermissionRequestHookInput` (ToolName, ToolInput map[string]any, PermissionSuggestions []any omitempty) - intentionally no agent_id/agent_type until Phase2 item #13 (Python PR #628)
+- New hook output structs (PR #545): `NotificationHookSpecificOutput`, `SubagentStartHookSpecificOutput` (both: HookEventName + AdditionalContext *string omitempty); `PermissionRequestHookSpecificOutput` (HookEventName + Decision map[string]any - required, no omitempty)
+- Missing fields added (PR #545): `ToolUseID string` on PreToolUseHookInput and PostToolUseHookInput; `AgentID`, `AgentTranscriptPath`, `AgentType` as flat required string fields on SubagentStopHookInput (NOT via mixin - mixin is a separate construct landing in PR #628); `AdditionalContext *string` on PreToolUseHookSpecificOutput; `UpdatedMCPToolOutput any` (Go acronym casing, wire tag `updatedMCPToolOutput`) on PostToolUseHookSpecificOutput
+- getAnySlice helper in hooks.go: mirrors getMap; returns nil when key absent (Python NotRequired semantics); use for []any typed fields
+- PostToolUseFailureHookInput fields: `ToolUseID string`, `Error string`, `IsInterrupt *bool json:"is_interrupt,omitempty"`; nil `IsInterrupt` maps to key absent in JSON (Python `NotRequired[bool]`); `PostToolUseFailureHookSpecificOutput` is structurally identical to `PostToolUseHookSpecificOutput` (only `HookEventName` literal differs), both have `AdditionalContext *string` (omitempty); `_SubagentContextMixin` fields (`agent_id`/`agent_type`) still deferred to Phase2 item #13 (Python PR #628)
+- `InitializeRequest.Skills *[]string` (`json:"skills,omitempty"`): pointer keeps an empty list (disable all Skills) distinct from nil (no filter, key absent), as in Python; set by `control.WithSkills`, which the subprocess `skillsProtocolOption` adds only when `Options.Skills` is a `[]string`
+- `routeMcpMethod` in mcp.go dispatches JSONRPC methods; the `tools/list` branch delegates to `buildToolsListResult` (standalone helper, not inlined) to keep dispatch under the gocyclo budget - no `//nolint:gocyclo` needed on `routeMcpMethod`; `tools/list` wire behavior: `nil` Annotations omits the `"annotations"` key entirely; `&ToolAnnotations{}` (non-nil, all pointer fields unset) emits `"annotations": {}` (key present, empty map); camelCase wire keys verified by `TestMcpToolsListResponseAnnotationsAllFields`: `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`; test assertions on `routeMcpMethod` results must use ok-pattern guards (`v, ok := result["result"].(map[string]any); if !ok { t.Fatal(...) }`) rather than chained type assertions to satisfy staticcheck SA5011
 
 <!-- END AUTO-MANAGED -->
 

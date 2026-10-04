@@ -76,19 +76,7 @@ func (p *Protocol) routeMcpMethod(ctx context.Context, server McpServer, msg map
 		if err != nil {
 			return nil, err
 		}
-		toolsData := make([]map[string]any, len(tools))
-		for i, t := range tools {
-			toolsData[i] = map[string]any{
-				"name":        t.Name,
-				"description": t.Description,
-				"inputSchema": t.InputSchema,
-			}
-		}
-		return map[string]any{
-			"jsonrpc": "2.0",
-			"id":      msgID,
-			"result":  map[string]any{"tools": toolsData},
-		}, nil
+		return buildToolsListResult(tools, msgID)
 
 	case "tools/call":
 		if params == nil {
@@ -151,7 +139,50 @@ func (p *Protocol) sendMcpResponse(ctx context.Context, requestID string, mcpRes
 	if err != nil {
 		return fmt.Errorf("failed to marshal MCP response: %w", err)
 	}
-	return p.transport.Write(ctx, append(data, '\n'))
+	return p.writeControlResponse(ctx, data)
+}
+
+// buildToolsListResult builds the JSONRPC tools/list response payload from a
+// slice of tool definitions. Kept standalone from the routeMcpMethod dispatch
+// switch so the switch stays within the gocyclo budget, and so additions to
+// the response shape do not perturb method-dispatch logic.
+func buildToolsListResult(tools []McpToolDefinition, msgID any) (map[string]any, error) {
+	toolsData := make([]map[string]any, len(tools))
+	for i, t := range tools {
+		entry := map[string]any{
+			"name":        t.Name,
+			"description": t.Description,
+			"inputSchema": t.InputSchema,
+		}
+		if t.Annotations != nil {
+			annMap, err := annotationsToMap(t.Annotations)
+			if err != nil {
+				return nil, err
+			}
+			entry["annotations"] = annMap
+		}
+		toolsData[i] = entry
+	}
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"id":      msgID,
+		"result":  map[string]any{"tools": toolsData},
+	}, nil
+}
+
+// annotationsToMap converts a ToolAnnotations value to a map[string]any with
+// json `omitempty` honored, so only the fields the caller set appear on the
+// wire. Empty fields are omitted from the resulting map.
+func annotationsToMap(ann *ToolAnnotations) (map[string]any, error) {
+	raw, err := json.Marshal(ann)
+	if err != nil {
+		return nil, fmt.Errorf("marshal annotations: %w", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("unmarshal annotations: %w", err)
+	}
+	return out, nil
 }
 
 // sendMcpErrorResponse sends an MCP JSONRPC error response.

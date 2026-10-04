@@ -1,0 +1,696 @@
+package subprocess
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"os/exec"
+	"os/signal"
+	"regexp"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// TestMain dispatches based on the CLAUDE_SDK_TEST_MOCK_MODE env var so the
+// compiled test binary can act as a cross-platform mock CLI when re-spawned.
+//
+// This is the Go analog of Python's sys.executable -c "..." pattern and matches
+// the os/exec stdlib idiom (TestHelperProcess). It replaces .bat/.sh fixtures
+// so the same Go code handles control-protocol participation on every OS.
+//
+// When CLAUDE_SDK_TEST_MOCK_MODE is set, the binary runs the mock handler and
+// exits via os.Exit before m.Run() is reached. The set of supported modes
+// matches the TransportMockOption constructors and the per-test helpers below.
+//
+// Parallel-subtest constraint: mode selection uses t.Setenv, which is per-test
+// and is incompatible with sibling subtests running in parallel under different
+// modes. None of the affected tests call t.Parallel() at these sites; keep it
+// that way when adding new helpers.
+func TestMain(m *testing.M) {
+	if mode := os.Getenv(envMockMode); mode != "" {
+		runMockCLI(mode)
+		// runMockCLI calls os.Exit. Defensive return for safety.
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// Env vars used to drive the in-process mock CLI. Keep these tightly scoped to
+// the subprocess package so unrelated tests can't accidentally trigger them.
+const (
+	envMockMode = "CLAUDE_SDK_TEST_MOCK_MODE"
+	// envMockEventLog names a file where shutdown modes append "NAME <unix-ms>" lines.
+	envMockEventLog = "CLAUDE_SDK_TEST_MOCK_EVENT_LOG"
+	// envMockPidFile names a file where the orphan modes write their descendant's pid.
+	envMockPidFile = "CLAUDE_SDK_TEST_MOCK_PID_FILE"
+)
+
+// Mock modes. Order matches the TransportMockOption constructors above so the
+// mapping stays auditable.
+const (
+	mockModeDefault             = "default"
+	mockModeLongRunning         = "long_running"
+	mockModeShouldFail          = "should_fail"
+	mockModeCheckEnvironment    = "check_environment"
+	mockModeInvalidOutput       = "invalid_output"
+	mockModeWithControlProtocol = "with_control_protocol"
+	mockModeWithStderr          = "with_stderr"
+	mockModeInitError           = "init_error"
+	mockModeBurstExit           = "burst_exit"
+	mockModeExitBeforeInit      = "exit_before_init"
+	mockModeStdoutClosedAlive   = "stdout_closed_alive"
+	mockModeHangInit            = "hang_init"
+	mockModeEarlyErrorResult    = "early_error_result"
+	mockModeTwoPermissionReqs   = "two_permission_requests"
+	mockModeExitNonZero         = "exit_nonzero"
+	mockModeErrorResultExit     = "error_result_exit"
+	mockModeBurstErrorResult    = "burst_error_result_exit"
+	mockModeIgnoreSIGTERM       = "ignore_sigterm"
+	mockModeSlowExitAfterEOF    = "slow_exit_after_eof"
+	mockModeStopReading         = "stop_reading"
+	mockModeFixedSizeLine       = "fixed_size_line"
+	mockModeExitClean           = "exit_clean"
+	mockModeOrphanStdout        = "orphan_stdout"
+	mockModeHoldStdout          = "hold_stdout"
+	mockModeServerInfo          = "server_info"
+	mockModeIgnoreInterrupt     = "ignore_interrupt"
+	mockModeExitOnInterrupt     = "exit_on_interrupt"
+	mockModeOverflowOnInterrupt = "overflow_on_interrupt"
+	mockModeCloseOrphanStdout   = "close_orphan_stdout"
+	mockModeOrphanOutput        = "orphan_stdout_and_stderr"
+	mockModeOrphanHolder        = "orphan_holder"
+)
+
+// Event names written to the mock event log.
+const (
+	mockEventEOF     = "EOF"
+	mockEventSIGTERM = "SIGTERM"
+	mockEventExit    = "EXIT"
+	// mockEventInterrupt is logged when ignore_interrupt receives an interrupt request.
+	mockEventInterrupt = "INTERRUPT"
+)
+
+// runMockCLI dispatches to per-mode handlers. Kept thin so gocyclo stays low.
+//
+// Every mode except shouldFail honors `-v` first to satisfy
+// cli.CheckCLIVersion before the test exercises the streaming flow.
+func runMockCLI(mode string) {
+	if mode != mockModeShouldFail && handleVersionFlag() {
+		os.Exit(0)
+	}
+
+	switch mode {
+	case mockModeDefault:
+		runMockDefault()
+	case mockModeLongRunning:
+		runMockLongRunning()
+	case mockModeShouldFail:
+		runMockShouldFail()
+	case mockModeCheckEnvironment:
+		runMockCheckEnvironment()
+	case mockModeInvalidOutput:
+		runMockInvalidOutput()
+	case mockModeWithControlProtocol:
+		runMockWithControlProtocol()
+	case mockModeWithStderr:
+		runMockWithStderr()
+	case mockModeInitError:
+		runMockInitError()
+	case mockModeBurstExit:
+		runMockBurstExit()
+	case mockModeExitBeforeInit:
+		os.Exit(17)
+	case mockModeStdoutClosedAlive:
+		// Stay alive with stdout closed: stdout EOF must not be taken as exit.
+		_ = os.Stdout.Close()
+		time.Sleep(time.Hour)
+	case mockModeHangInit:
+		// Never answer initialize, so only ctx cancellation ends Connect.
+		time.Sleep(time.Hour)
+	case mockModeEarlyErrorResult:
+		runMockEarlyErrorResult()
+	case mockModeTwoPermissionReqs:
+		runMockTwoPermissionRequests()
+	case mockModeExitNonZero:
+		answerInitialize()
+		fmt.Println(burstExitAssistantMsg)
+		os.Exit(mockCrashExitCode)
+	case mockModeErrorResultExit:
+		answerInitialize()
+		fmt.Println(`{"type":"result","subtype":"error_max_turns","duration_ms":1,"duration_api_ms":1,"is_error":true,"num_turns":1,"session_id":"s","total_cost_usd":0,"errors":["max turns reached"]}`)
+		os.Exit(1)
+	default:
+		runShutdownMock(mode)
+	}
+	os.Exit(0)
+}
+
+// handleVersionFlag prints "3.0.0" and returns true when invoked as `cli -v`,
+// matching cli.CheckCLIVersion's expectations. Returns false otherwise so the
+// caller can continue into stream-json mode.
+func handleVersionFlag() bool {
+	if len(os.Args) > 1 && os.Args[1] == "-v" {
+		fmt.Println("3.0.0")
+		return true
+	}
+	return false
+}
+
+const assistantMsg = `{"type":"assistant","content":[{"type":"text","text":"Mock response"}],"model":"claude-3"}`
+
+// runMockDefault emits one assistant message, then loops on stdin echoing a
+// control_response for every control_request so the unconditional initialize
+// handshake completes.
+func runMockDefault() {
+	fmt.Println(assistantMsg)
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// runMockLongRunning blocks termination for 6s after SIGTERM to exercise the
+// SIGTERM -> SIGKILL escalation. On Windows SIGTERM is delivered by os/exec
+// only via TerminateProcess; signal.Notify wires SIGTERM where the runtime
+// supports it (Unix), and the read-loop is what keeps the process alive long
+// enough on Windows for Close() to escalate to Kill().
+func runMockLongRunning() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		// Ignore SIGTERM for 6 seconds to force the 5-second timeout path.
+		time.Sleep(6 * time.Second)
+		os.Exit(1)
+	}()
+
+	fmt.Println(`{"type":"assistant","content":[{"type":"text","text":"Long running mock"}],"model":"claude-3"}`)
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// runMockShouldFail writes an error line and exits non-zero so Connect can
+// surface the initialize failure path.
+func runMockShouldFail() {
+	fmt.Fprintln(os.Stderr, "Mock CLI failing")
+	os.Exit(1)
+}
+
+// runMockCheckEnvironment validates that the SDK forwarded CLAUDE_CODE_ENTRYPOINT
+// before responding. Mirrors the original .sh check.
+func runMockCheckEnvironment() {
+	ep := os.Getenv("CLAUDE_CODE_ENTRYPOINT")
+	if ep != "sdk-go" && ep != "sdk-go-client" {
+		fmt.Fprintln(os.Stderr, "Missing environment variable")
+		os.Exit(1)
+	}
+	fmt.Println(`{"type":"assistant","content":[{"type":"text","text":"Environment OK"}],"model":"claude-3"}`)
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// runMockInvalidOutput responds to the initialize control request first so the
+// handshake completes, then emits garbage + invalid JSON + a valid message to
+// exercise the parser's resilience.
+func runMockInvalidOutput() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	if scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Println(buildControlResponse(extractRequestID(line)))
+		}
+	}
+	fmt.Println("This is not valid JSON output")
+	fmt.Println(`{"invalid": json}`)
+	fmt.Println(`{"type":"assistant","content":[{"type":"text","text":"Valid after invalid"}],"model":"claude-3"}`)
+	// Keep draining stdin and responding to any further control requests.
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Println(buildControlResponse(extractRequestID(line)))
+		}
+	}
+}
+
+// runMockWithControlProtocol drives the control-message routing test: emit a
+// regular assistant message, then echo back a control_response for each
+// control_request seen on stdin.
+func runMockWithControlProtocol() {
+	fmt.Println(assistantMsg)
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// runMockWithStderr emits stderr lines, then proceeds like the default mode.
+func runMockWithStderr() {
+	fmt.Fprintln(os.Stderr, "Stderr line 1")
+	fmt.Fprintln(os.Stderr, "Stderr line 2")
+	fmt.Println(assistantMsg)
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// runMockInitError emits its PID on stderr so the test can verify reaping,
+// then responds to the initialize control request with an error subtype and
+// keeps reading stdin so the SDK must explicitly terminate the process.
+// Used to verify that a failed Connect tears the subprocess down.
+func runMockInitError() {
+	fmt.Fprintf(os.Stderr, "MOCK_PID=%d\n", os.Getpid())
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Printf(
+				`{"type":"control_response","response":{"subtype":"error","request_id":%q,"error":"mock init failure"}}`+"\n",
+				extractRequestID(line),
+			)
+		}
+	}
+}
+
+// burstExitMessageCount is large enough to overflow the OS pipe buffer, so
+// some output is still unread in the pipe when the mock exits.
+const burstExitMessageCount = 2000
+
+const burstExitAssistantMsg = `{"type":"assistant","message":{"content":[{"type":"text","text":"burst"}],"model":"claude-3"}}`
+
+// runMockBurstExit answers initialize, writes a burst of assistant messages,
+// and exits without waiting for stdin to close. A reader must still receive
+// every line after the process is reaped.
+func runMockBurstExit() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Println(buildControlResponse(extractRequestID(line)))
+			break
+		}
+	}
+	out := bufio.NewWriter(os.Stdout)
+	for i := 0; i < burstExitMessageCount; i++ {
+		_, _ = fmt.Fprintln(out, burstExitAssistantMsg)
+	}
+	_ = out.Flush()
+}
+
+// burstErrorResultAssistants is the number of assistant messages
+// burst_error_result_exit writes before its error result. Together with the
+// result it exceeds msgChan's capacity, so the transport blocks on a slow
+// reader while the CLI has already exited.
+const burstErrorResultAssistants = 15
+
+const mockErrorResult = `{"type":"result","subtype":"error_during_execution","duration_ms":1,"duration_api_ms":1,"is_error":true,"num_turns":1,"session_id":"s","total_cost_usd":0}`
+
+// runMockEarlyErrorResult writes an error result before and after answering
+// initialize, so handleStdout routes init errors while Connect still runs.
+func runMockEarlyErrorResult() {
+	fmt.Println(mockErrorResult)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Println(buildControlResponse(extractRequestID(line)))
+			break
+		}
+	}
+	fmt.Println(mockErrorResult)
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// Tool names used by the two_permission_requests mode.
+const (
+	mockSlowToolName = "slow_tool"
+	mockFastToolName = "fast_tool"
+)
+
+// runMockTwoPermissionRequests answers initialize, then sends two can_use_tool
+// requests back to back, then keeps echoing control requests.
+func runMockTwoPermissionRequests() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Println(buildControlResponse(extractRequestID(line)))
+			break
+		}
+	}
+	for _, tool := range []string{mockSlowToolName, mockFastToolName} {
+		fmt.Printf(
+			`{"type":"control_request","request_id":"req_%s","request":{"subtype":"can_use_tool","tool_name":%q,"input":{}}}`+"\n",
+			tool, tool,
+		)
+	}
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// slowExitDelay is how long slow_exit_after_eof keeps running after stdin EOF.
+const slowExitDelay = 1500 * time.Millisecond
+
+// runShutdownMock runs the modes runMockCLI does not handle itself and exits 2
+// for an unknown mode. Split from runMockCLI to keep its complexity flat.
+func runShutdownMock(mode string) {
+	switch mode {
+	case mockModeExitClean:
+		answerInitialize()
+	case mockModeOrphanStdout:
+		runMockOrphanStdout()
+	case mockModeHoldStdout:
+		time.Sleep(orphanHoldTime)
+	case mockModeServerInfo:
+		runMockServerInfo()
+	case mockModeIgnoreSIGTERM:
+		runMockIgnoreSIGTERM()
+	case mockModeSlowExitAfterEOF:
+		runMockSlowExitAfterEOF()
+	case mockModeBurstErrorResult:
+		runMockBurstErrorResult()
+	case mockModeIgnoreInterrupt:
+		runMockIgnoreInterrupt()
+	case mockModeExitOnInterrupt:
+		runMockOnInterrupt(func() { os.Exit(1) })
+	case mockModeOverflowOnInterrupt:
+		runMockOnInterrupt(func() { fmt.Println(strings.Repeat("x", overflowLineSize)) })
+	case mockModeCloseOrphanStdout:
+		runMockOrphan(false)
+	case mockModeOrphanOutput:
+		runMockOrphan(true)
+	case mockModeOrphanHolder:
+		time.Sleep(orphanHolderLifetime)
+	case mockModeStopReading:
+		answerInitialize()
+		// Never read stdin again, so the SDK's stdin writes block once the pipe is full.
+		time.Sleep(2 * time.Minute)
+	default:
+		runStreamMock(mode)
+	}
+}
+
+// runStreamMock runs the stdout framing modes and exits 2 for an unknown mode.
+func runStreamMock(mode string) {
+	switch mode {
+	case mockModeFixedSizeLine:
+		answerInitialize()
+		fmt.Println(fixedSizeAssistantLine(mockFixedLineLen))
+		controlEchoLoop(os.Stdin, os.Stdout)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown mock CLI mode: %s\n", mode)
+		os.Exit(2)
+	}
+}
+
+// mockFixedLineLen is the byte length of the line fixed_size_line writes.
+const mockFixedLineLen = 4096
+
+// fixedSizeAssistantLine returns an assistant message line of exactly n bytes.
+func fixedSizeAssistantLine(n int) string {
+	const prefix = `{"type":"assistant","message":{"content":[{"type":"text","text":"`
+	const suffix = `"}],"model":"claude-3"}}`
+	return prefix + strings.Repeat("x", n-len(prefix)-len(suffix)) + suffix
+}
+
+// orphanHoldTime is how long the hold_stdout descendant keeps stdout open
+// after the orphan_stdout mock has exited.
+const orphanHoldTime = 4 * time.Second
+
+// runMockOrphanStdout answers initialize, starts a descendant that inherits
+// stdout and outlives it, then exits non-zero. The CLI is gone while stdout
+// stays open, like a CLI whose background child kept the pipe.
+func runMockOrphanStdout() {
+	answerInitialize()
+	//nolint:gosec // G204: re-runs the test binary as the descendant
+	descendant := exec.Command(os.Args[0])
+	descendant.Env = append(os.Environ(), envMockMode+"="+mockModeHoldStdout)
+	descendant.Stdout = os.Stdout
+	if err := descendant.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "start descendant: %v\n", err)
+	}
+	os.Exit(mockCrashExitCode)
+}
+
+// mockInitializeResponse is the initialize response of the server_info mode,
+// in the shape the CLI sends.
+const mockInitializeResponse = `{"commands":[{"name":"compact","description":"Compact the conversation","argumentHint":""}],` +
+	`"output_style":"default","available_output_styles":["default","Explanatory"],` +
+	`"models":[{"value":"opus[1m]","resolvedModel":"claude-opus-5-5[1m]","displayName":"Opus (1M context)",` +
+	`"description":"Most capable","supportsEffort":true,"supportedEffortLevels":["low","high"]},` +
+	`{"value":"haiku","displayName":"Haiku","description":"Fastest"}],` +
+	`"account":{"subscriptionType":"max"}}`
+
+// runMockServerInfo answers initialize with mockInitializeResponse, then
+// echoes control requests.
+func runMockServerInfo() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Printf(`{"type":"control_response","response":{"subtype":"success","request_id":%q,"response":%s}}`+"\n",
+				extractRequestID(line), mockInitializeResponse)
+			break
+		}
+	}
+	controlEchoLoop(os.Stdin, os.Stdout)
+}
+
+// runMockBurstErrorResult answers initialize, writes the assistant messages
+// and an error result without waiting for the reader, then exits 1.
+func runMockBurstErrorResult() {
+	answerInitialize()
+	for i := 0; i < burstErrorResultAssistants; i++ {
+		fmt.Println(burstExitAssistantMsg)
+	}
+	fmt.Println(mockErrorResult)
+	os.Exit(1)
+}
+
+// runMockIgnoreInterrupt answers every control request except an interrupt,
+// which it logs and leaves unanswered. It exits when stdin closes.
+func runMockIgnoreInterrupt() {
+	runMockOnInterrupt(func() { logMockEvent(mockEventInterrupt) })
+}
+
+// overflowLineSize exceeds the small MaxBufferSize the overflow_on_interrupt
+// test configures, so the transport's stdout scanner fails on the line.
+const overflowLineSize = 4096
+
+// runMockOnInterrupt answers every control request except an interrupt, which
+// runs onInterrupt and is left unanswered. It returns when stdin closes.
+func runMockOnInterrupt(onInterrupt func()) {
+	answerInitialize()
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !isControlRequest(line) {
+			continue
+		}
+		if strings.Contains(line, `"subtype":"interrupt"`) {
+			onInterrupt()
+			continue
+		}
+		fmt.Println(buildControlResponse(extractRequestID(line)))
+	}
+}
+
+// orphanHolderLifetime is how long the descendant started by the orphan modes
+// keeps its inherited output pipes open. It must outlast the 5 second wait a
+// Close that blocks on the readers would pay.
+const orphanHolderLifetime = 15 * time.Second
+
+// runMockOrphan answers initialize and starts a copy of the test binary that
+// inherits the CLI's stdout (and stderr when withStderr) and outlives it, like
+// an MCP server or background shell the CLI spawned. The CLI then exits at
+// once, so only the descendant still holds the pipes.
+func runMockOrphan(withStderr bool) {
+	answerInitialize()
+	holder := exec.Command(os.Args[0]) //nolint:gosec // re-execs the test binary as the descendant
+	holder.Env = append(os.Environ(), envMockMode+"="+mockModeOrphanHolder)
+	holder.Stdout = os.Stdout
+	if withStderr {
+		holder.Stderr = os.Stderr
+	}
+	if err := holder.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "start descendant: %v\n", err)
+		os.Exit(2)
+	}
+	if path := os.Getenv(envMockPidFile); path != "" {
+		_ = os.WriteFile(path, []byte(fmt.Sprint(holder.Process.Pid)), 0o600)
+	}
+}
+
+// runMockIgnoreSIGTERM logs and ignores SIGTERM, so only SIGKILL ends it.
+func runMockIgnoreSIGTERM() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
+	go func() {
+		for range sigChan {
+			logMockEvent(mockEventSIGTERM)
+		}
+	}()
+	controlEchoLoop(os.Stdin, os.Stdout)
+	logMockEvent(mockEventEOF)
+	time.Sleep(time.Minute)
+}
+
+// runMockSlowExitAfterEOF writes output and keeps running for a while after
+// stdin EOF, like a CLI that saves its session before it exits. SIGTERM is
+// logged and ends the process with a non-zero code.
+func runMockSlowExitAfterEOF() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		logMockEvent(mockEventSIGTERM)
+		os.Exit(143)
+	}()
+	controlEchoLoop(os.Stdin, os.Stdout)
+	logMockEvent(mockEventEOF)
+	fmt.Println(assistantMsg)
+	time.Sleep(slowExitDelay)
+	logMockEvent(mockEventExit)
+}
+
+// logMockEvent appends "name <unix-ms>" to the event log file, if one is set.
+func logMockEvent(name string) {
+	path := os.Getenv(envMockEventLog)
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // path is constructed from test temp dir
+	if err != nil {
+		return
+	}
+	_, _ = fmt.Fprintf(f, "%s %d\n", name, time.Now().UnixNano()/int64(time.Millisecond))
+	_ = f.Close()
+}
+
+// mockCrashExitCode is the exit code of the exit_nonzero mode.
+const mockCrashExitCode = 3
+
+// answerInitialize answers the first control request (initialize) and returns.
+func answerInitialize() {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			fmt.Println(buildControlResponse(extractRequestID(line)))
+			return
+		}
+	}
+}
+
+// controlEchoLoop reads JSON-line stdin and replies to every control_request
+// with a success control_response carrying the matching request_id. Returns
+// when stdin closes.
+func controlEchoLoop(in *os.File, out *os.File) {
+	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isControlRequest(line) {
+			_, _ = fmt.Fprintln(out, buildControlResponse(extractRequestID(line)))
+		}
+	}
+}
+
+// requestIDRegex matches `"request_id":"<value>"` in a JSON line. Compiled once
+// at package init.
+var requestIDRegex = regexp.MustCompile(`"request_id":"([^"]+)"`)
+
+func isControlRequest(line string) bool {
+	return strings.Contains(line, "control_request")
+}
+
+func extractRequestID(line string) string {
+	m := requestIDRegex.FindStringSubmatch(line)
+	if len(m) < 2 {
+		return "req_1_mock"
+	}
+	return m[1]
+}
+
+func buildControlResponse(requestID string) string {
+	return fmt.Sprintf(
+		`{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}`,
+		requestID,
+	)
+}
+
+// --- Helper API for tests ------------------------------------------------
+
+// newTransportMockCLI returns os.Args[0] (the test binary) configured to act
+// as a default-mode mock CLI for the duration of the test. Mode is propagated
+// via t.Setenv (auto-cleaned at test end).
+func newTransportMockCLI(t *testing.T) string {
+	t.Helper()
+	return newTransportMockCLIWithOptions(t)
+}
+
+// newTransportMockCLIWithOptions returns the test binary path configured for a
+// specific mock mode. The mode is derived from the first matching option,
+// keeping parity with the legacy script-based factory.
+func newTransportMockCLIWithOptions(t *testing.T, options ...TransportMockOption) string {
+	t.Helper()
+	opts := &transportMockOptions{}
+	for _, opt := range options {
+		opt(opts)
+	}
+
+	mode := mockModeDefault
+	switch {
+	case opts.shouldFail:
+		mode = mockModeShouldFail
+	case opts.longRunning:
+		mode = mockModeLongRunning
+	case opts.checkEnvironment:
+		mode = mockModeCheckEnvironment
+	case opts.invalidOutput:
+		mode = mockModeInvalidOutput
+	}
+
+	t.Setenv(envMockMode, mode)
+	return os.Args[0]
+}
+
+// newTransportMockCLIWithControlProtocol returns the test binary configured to
+// participate in the control protocol without emitting an initial assistant
+// message before stdin is drained.
+func newTransportMockCLIWithControlProtocol(t *testing.T) string {
+	t.Helper()
+	t.Setenv(envMockMode, mockModeWithControlProtocol)
+	return os.Args[0]
+}
+
+// newTransportMockCLIWithStderr returns the test binary configured to emit
+// stderr lines plus a default-mode assistant message and control-loop.
+func newTransportMockCLIWithStderr(t *testing.T) string {
+	t.Helper()
+	t.Setenv(envMockMode, mockModeWithStderr)
+	return os.Args[0]
+}
+
+// newTransportMockCLIMode returns the test binary configured for mode.
+func newTransportMockCLIMode(t *testing.T, mode string) string {
+	t.Helper()
+	t.Setenv(envMockMode, mode)
+	return os.Args[0]
+}
+
+// newTransportMockCLIBurstExit returns the test binary configured to write a
+// burst of messages after initialize and exit at once.
+func newTransportMockCLIBurstExit(t *testing.T) string {
+	t.Helper()
+	t.Setenv(envMockMode, mockModeBurstExit)
+	return os.Args[0]
+}
+
+// newTransportMockCLIInitError returns the test binary configured to reply to
+// initialize with an error subtype while keeping the process alive on stdin.
+// Exercises the Connect-fails cleanup path.
+func newTransportMockCLIInitError(t *testing.T) string {
+	t.Helper()
+	t.Setenv(envMockMode, mockModeInitError)
+	return os.Args[0]
+}

@@ -450,7 +450,7 @@ func validateConcurrentClients(t *testing.T, ctx context.Context, transport *int
 
 	t.Logf("Concurrent clients validated: %d/%d succeeded", numClients-errorCount, numClients)
 
-	// Clean up transport state after concurrent test - following established patterns
+	// Clean up transport state after concurrent test.
 	transport.mu.Lock()
 	transport.connected = false
 	transport.mu.Unlock()
@@ -491,7 +491,7 @@ func validateResourceCleanup(t *testing.T, ctx context.Context, transport *integ
 	// Resource cleanup verification is handled by the test framework after defers complete
 	t.Logf("Resource cleanup validated: goroutines %d->%d", initialGoroutines, finalGoroutines)
 
-	// Clean up transport state after resource test - following established patterns
+	// Clean up transport state after resource test.
 	transport.mu.Lock()
 	transport.connected = false
 	transport.mu.Unlock()
@@ -610,7 +610,7 @@ func validateStressTest(t *testing.T, ctx context.Context, transport *integratio
 	t.Logf("Stress test validated: %d messages, %d concurrent, %.1f%% success, avg latency: %v",
 		opts.messageCount, opts.concurrent, successRate, avgLatency)
 
-	// Clean up transport state after stress test - following established patterns
+	// Clean up transport state after stress test.
 	transport.mu.Lock()
 	transport.connected = false
 	transport.mu.Unlock()
@@ -762,9 +762,7 @@ func validateNetworkIsolation(t *testing.T, ctx context.Context, transport *inte
 	t.Logf("Network isolation validated: offline mode detected")
 }
 
-// New failing tests that will validate our fixes (RED phase of TDD)
-
-// validateSpecificResourceCleanup validates strict resource cleanup following client_test.go patterns
+// validateSpecificResourceCleanup validates strict resource cleanup.
 func validateSpecificResourceCleanup(t *testing.T, ctx context.Context, transport *integrationMockTransport, opts *integrationTestOptions) {
 	t.Helper()
 
@@ -796,11 +794,10 @@ func validateSpecificResourceCleanup(t *testing.T, ctx context.Context, transpor
 		}
 	}() // Client should be disconnected here
 
-	// This should pass after we fix the goroutine management
 	assertResourcesReleased(t, transport, initialGoroutines, 1) // Allow 1 goroutine tolerance
 }
 
-// validateStrictTransportState validates transport state transitions following client_test.go patterns
+// validateStrictTransportState validates transport state transitions.
 func validateStrictTransportState(t *testing.T, ctx context.Context, transport *integrationMockTransport, opts *integrationTestOptions) {
 	t.Helper()
 

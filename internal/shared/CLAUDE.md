@@ -31,6 +31,19 @@ shared/
 - Concrete types: `UserMessage`, `AssistantMessage`, `SystemMessage`, `ResultMessage`
 - Content blocks: `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ToolResultBlock`
 
+**UserMessage fields**:
+- `Content`: string or `[]ContentBlock`
+- `UUID`, `ParentToolUseID`: optional string pointers
+- `ToolUseResult map[string]any`: rich edit metadata (filePath, structuredPatch, diffs); use `HasToolUseResult()` / `GetToolUseResult()`
+
+**AssistantMessage error field**:
+- `Error *AssistantMessageError`: typed string parsed from top-level `data["error"]` (not nested `data["message"]["error"]`)
+- Python SDK parity constants (all six values from `types.py` `AssistantMessageError` Literal): `AssistantMessageErrorAuthFailed="authentication_failed"`, `AssistantMessageErrorBilling="billing_error"`, `AssistantMessageErrorRateLimit="rate_limit"`, `AssistantMessageErrorInvalidRequest="invalid_request"`, `AssistantMessageErrorServer="server_error"`, `AssistantMessageErrorUnknown="unknown"`
+- Helper methods: `HasError()`, `GetError()`, `IsRateLimited()`
+
+**StreamMessage wire shape**:
+- `StreamMessage.SessionID` and `StreamMessage.ParentToolUseID` intentionally lack `omitempty`; both fields are always emitted (`"session_id":""` and `"parent_tool_use_id":null` when unset), matching the Python and TypeScript SDK wire shape
+
 <!-- END AUTO-MANAGED -->
 
 <!-- AUTO-MANAGED: conventions -->

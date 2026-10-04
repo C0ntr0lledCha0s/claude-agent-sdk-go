@@ -15,7 +15,7 @@
 // - WithStderrCallback: Line-by-line stderr monitoring
 // - WithEnv: Set multiple environment variables
 // - WithEnvVar: Set a single environment variable
-// - GetServerInfo: Get connection status information
+// - GetServerInfo: Get the CLI's initialize response (commands, models, ...)
 // - GetStreamStats: Get streaming statistics
 // - GetStreamIssues: Get validation issues from stream
 //
@@ -179,16 +179,14 @@ func demonstrateServerDiagnostics() {
 	fmt.Println("Connecting to demonstrate diagnostics methods...")
 
 	err := claudecode.WithClient(ctx, func(client claudecode.Client) error {
-		// GetServerInfo - connection status
+		// GetServerInfo - the CLI's initialize response
 		fmt.Println()
-		fmt.Println("GetServerInfo() - Connection status:")
+		fmt.Println("GetServerInfo() - Initialize response:")
 		info, err := client.GetServerInfo(ctx)
 		if err != nil {
 			fmt.Printf("  Error: %v\n", err)
 		} else {
-			for k, v := range info {
-				fmt.Printf("  %s: %v\n", k, v)
-			}
+			printServerInfo(info)
 		}
 
 		// Send a query to generate some stats
@@ -206,6 +204,17 @@ func demonstrateServerDiagnostics() {
 				}
 				switch msg := message.(type) {
 				case *claudecode.AssistantMessage:
+					// HasError checks the top-level error field on the assistant message.
+					// This is distinct from ResultMessage.IsError - it signals a rate limit,
+					// billing issue, or server error on the message itself.
+					if msg.HasError() {
+						errType := msg.GetError()
+						if msg.IsRateLimited() {
+							fmt.Printf("\n[rate limited] %s\n", errType)
+						} else {
+							fmt.Printf("\n[assistant error] %s\n", errType)
+						}
+					}
 					for _, block := range msg.Content {
 						if textBlock, ok := block.(*claudecode.TextBlock); ok {
 							fmt.Printf("\nClaude: %s\n", textBlock.Text)
@@ -290,5 +299,21 @@ func init() {
 				fmt.Fprintln(logFile, "[STDERR]", line)
 			}),
 		)
+	}
+}
+
+// printServerInfo prints a summary of the CLI's initialize response.
+func printServerInfo(info map[string]interface{}) {
+	if commands, ok := info["commands"].([]interface{}); ok {
+		fmt.Printf("  commands: %d available\n", len(commands))
+	}
+	if style, ok := info["output_style"].(string); ok {
+		fmt.Printf("  output_style: %s\n", style)
+	}
+	models, _ := info["models"].([]interface{})
+	for _, m := range models {
+		if model, ok := m.(map[string]interface{}); ok {
+			fmt.Printf("  model: %v (%v)\n", model["value"], model["displayName"])
+		}
 	}
 }

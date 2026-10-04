@@ -12,7 +12,7 @@ import (
 //
 // Note: The Read() method returns a closed channel because we don't use the
 // protocol's built-in readLoop. Instead, subprocess.Transport routes control
-// messages directly to protocol.HandleIncomingMessage() from handleStdout().
+// messages to protocol.HandleIncomingMessageAsync() from handleStdout().
 type ProtocolAdapter struct {
 	stdin    io.Writer
 	mu       sync.Mutex
@@ -42,24 +42,23 @@ func (pa *ProtocolAdapter) Write(ctx context.Context, data []byte) error {
 	}
 
 	pa.mu.Lock()
-	defer pa.mu.Unlock()
+	closed := pa.closed
+	pa.mu.Unlock()
 
-	if pa.closed {
+	if closed || pa.stdin == nil {
 		return io.ErrClosedPipe
 	}
 
-	if pa.stdin == nil {
-		return io.ErrClosedPipe
-	}
-
+	// Written outside pa.mu so Close never waits for a blocked write; the
+	// stdin writer serializes writes.
 	_, err := pa.stdin.Write(data)
 	return err
 }
 
 // Read returns a channel for reading data from the subprocess.
 // This channel is pre-closed because we don't use the protocol's built-in
-// readLoop - instead, subprocess.Transport routes control messages directly
-// to protocol.HandleIncomingMessage() from handleStdout().
+// readLoop - instead, subprocess.Transport routes control messages to
+// protocol.HandleIncomingMessageAsync() from handleStdout().
 func (pa *ProtocolAdapter) Read(_ context.Context) <-chan []byte {
 	return pa.readChan
 }
