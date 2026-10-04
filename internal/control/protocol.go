@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -12,6 +13,10 @@ import (
 
 // DefaultInitTimeout is the default timeout for the Initialize handshake.
 const DefaultInitTimeout = 60 * time.Second
+
+// ErrProtocolClosed is returned by a control request that is sent after Close,
+// or that is still waiting for its response when Close runs.
+var ErrProtocolClosed = errors.New("control protocol closed")
 
 // Transport abstracts the I/O operations for the control protocol.
 // This allows testing with mock transports.
@@ -49,6 +54,7 @@ type Protocol struct {
 	initResult   map[string]any // the whole initialize response
 	initErrChan  chan error
 	closed       bool
+	closedCh     chan struct{} // closed by Close; wakes pending requests
 	started      bool
 
 	// Configuration
@@ -147,6 +153,7 @@ func NewProtocol(transport Transport, opts ...ProtocolOption) *Protocol {
 		messageStream:    make(chan map[string]any, 100),
 		initTimeout:      DefaultInitTimeout,
 		initErrChan:      make(chan error, 1),
+		closedCh:         make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -231,6 +238,10 @@ func (p *Protocol) SendControlRequest(ctx context.Context, request any, timeout 
 	responseChan := make(chan *Response, 1)
 
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, ErrProtocolClosed
+	}
 	p.pendingRequests[requestID] = responseChan
 	p.mu.Unlock()
 
@@ -267,6 +278,9 @@ func (p *Protocol) SendControlRequest(ctx context.Context, request any, timeout 
 
 	select {
 	case response := <-responseChan:
+		if response.failure != nil {
+			return nil, response.failure
+		}
 		if response.Subtype == ResponseSubtypeError {
 			return nil, fmt.Errorf("control request error: %s", response.Error)
 		}
@@ -274,6 +288,9 @@ func (p *Protocol) SendControlRequest(ctx context.Context, request any, timeout 
 
 	case err := <-p.initErrChan:
 		return nil, err
+
+	case <-p.closedCh:
+		return nil, ErrProtocolClosed
 
 	case <-timeoutCtx.Done():
 		return nil, fmt.Errorf("control request timeout: %w", timeoutCtx.Err())
@@ -297,6 +314,24 @@ func (p *Protocol) HandleControlInitErr(err error) {
 	select {
 	case p.initErrChan <- err:
 	default:
+	}
+}
+
+// FailPendingRequests fails every control request still waiting for a response
+// with err, because the CLI's stream ended with that error (Python: the reader
+// sets its error on every pending request). A request still waiting for the
+// initialize handshake is left alone: HandleControlInitErr already fails it.
+func (p *Protocol) FailPendingRequests(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.initialized {
+		return
+	}
+	for requestID, responseChan := range p.pendingRequests {
+		select {
+		case responseChan <- &Response{RequestID: requestID, failure: err}:
+		default:
+		}
 	}
 }
 
@@ -681,6 +716,7 @@ func (p *Protocol) Close() error {
 		return nil
 	}
 	p.closed = true
+	close(p.closedCh)
 	// Cancel in-flight handlers without waiting: a user callback that ignores
 	// ctx must not block Close (Python close() cancels child tasks too).
 	for requestID, cancel := range p.inflightRequests {

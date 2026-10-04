@@ -91,6 +91,109 @@ func TestTransportSendsExitErrorAfterLastMessage(t *testing.T) {
 	}
 }
 
+// TestCloseFailsPendingInterrupt verifies an Interrupt in flight when the
+// transport closes returns control.ErrProtocolClosed at once, instead of
+// waiting out its 5 second timeout for a CLI that never answers it.
+func TestCloseFailsPendingInterrupt(t *testing.T) {
+	ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+	defer cancel()
+
+	eventLog := setMockEventLog(t)
+	transport := setupTransportForTest(t, newTransportMockCLIMode(t, mockModeIgnoreInterrupt))
+	t.Cleanup(func() { _ = transport.Close() })
+	connectTransportSafely(ctx, t, transport)
+
+	result := make(chan error, 1)
+	go func() { result <- transport.Interrupt(ctx) }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, ok := readMockEvents(t, eventLog)[mockEventInterrupt]; ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the CLI never received the interrupt request")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	assertNoTransportError(t, transport.Close())
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, control.ErrProtocolClosed) {
+			t.Errorf("Interrupt error = %v, want control.ErrProtocolClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Interrupt still pending 2s after Close")
+	}
+}
+
+// TestStreamEndFailsPendingInterrupt verifies an Interrupt still waiting for
+// its response when the CLI's stream ends with an error returns that error at
+// once, instead of waiting out its 5 second timeout (Python: the reader's
+// error is set on every pending control request).
+func TestStreamEndFailsPendingInterrupt(t *testing.T) {
+	smallBuffer := 1024
+	tests := []struct {
+		name    string
+		mode    string
+		options *shared.Options
+		check   func(t *testing.T, err error)
+	}{
+		{
+			name:    "cli_exits_non_zero",
+			mode:    mockModeExitOnInterrupt,
+			options: &shared.Options{},
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				var processErr *shared.ProcessError
+				if !errors.As(err, &processErr) {
+					t.Fatalf("Interrupt error = %v (%T), want *ProcessError", err, err)
+				}
+				if processErr.ExitCode != 1 {
+					t.Errorf("ExitCode = %d, want 1", processErr.ExitCode)
+				}
+			},
+		},
+		{
+			// An over-limit line ends the stream with the buffer-size error (Python #190).
+			name:    "stdout_line_over_limit",
+			mode:    mockModeOverflowOnInterrupt,
+			options: &shared.Options{MaxBufferSize: &smallBuffer},
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				var decodeErr *shared.JSONDecodeError
+				if !errors.As(err, &decodeErr) || !strings.Contains(err.Error(), "maximum buffer size") {
+					t.Fatalf("Interrupt error = %v, want the buffer-size *JSONDecodeError", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+			defer cancel()
+
+			transport := New(newTransportMockCLIMode(t, tt.mode), tt.options, "sdk-go")
+			t.Cleanup(func() { _ = transport.Close() })
+			connectTransportSafely(ctx, t, transport)
+
+			start := time.Now()
+			result := make(chan error, 1)
+			go func() { result <- transport.Interrupt(ctx) }()
+
+			select {
+			case err := <-result:
+				tt.check(t, err)
+			case <-time.After(2 * time.Second):
+				t.Fatalf("Interrupt still pending %v after the stream ended with an error", time.Since(start))
+			}
+		})
+	}
+}
+
 // TestTransportConnectFailureReapsProcess verifies that a failed Connect
 // returns and reaps the CLI even with no context deadline. Connect only
 // returns after teardown observed the sole cmd.Wait completing.

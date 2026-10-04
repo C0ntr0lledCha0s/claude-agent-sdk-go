@@ -104,16 +104,26 @@ func (t *Transport) handleStdout(protocol *control.Protocol, child childProcess)
 	signalStdoutDone()
 	if err := scanner.Err(); err != nil {
 		if errors.Is(err, bufio.ErrTooLong) {
-			t.sendStreamError(parser.NewBufferOverflowError(maxLineSize, err))
+			t.endStreamWithError(protocol, parser.NewBufferOverflowError(maxLineSize, err))
 			return
 		}
-		t.sendStreamError(fmt.Errorf("stdout scanner error: %w", err))
+		t.endStreamWithError(protocol, fmt.Errorf("stdout scanner error: %w", err))
 		return
 	}
 	// A signal from our own teardown is not a CLI failure.
 	if err := child.exitError(t.ctx, lastErrorResult); err != nil && !t.isClosing() {
-		t.sendStreamError(err)
+		t.endStreamWithError(protocol, err)
 	}
+}
+
+// endStreamWithError reports the error that ended the CLI's stream. Control
+// requests still waiting for a response fail with it at once, and it is sent
+// to errChan.
+func (t *Transport) endStreamWithError(protocol *control.Protocol, err error) {
+	if protocol != nil {
+		protocol.FailPendingRequests(err)
+	}
+	t.sendStreamError(err)
 }
 
 // processStdoutLine parses one stdout line and routes its messages. It

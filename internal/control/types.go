@@ -75,6 +75,9 @@ type Response struct {
 	Response any `json:"response,omitempty"`
 	// Error contains the error message (only for error).
 	Error string `json:"error,omitempty"`
+
+	// failure is set locally when the stream ended before the CLI answered.
+	failure error
 }
 
 // InterruptRequest requests interruption of the current operation.
