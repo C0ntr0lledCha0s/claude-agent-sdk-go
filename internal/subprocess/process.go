@@ -78,6 +78,51 @@ func (t *Transport) terminateProcess() error {
 	}
 }
 
+// abortConnect tears down a Connect that failed after the CLI started (the
+// control protocol would not start, or the CLI exited or went silent before
+// answering the handshake). Unlike Close it does not wait out a graceful
+// SIGTERM: the process is killed at once. The order matters: the I/O
+// goroutines must have returned before cleanup() releases the pipes they
+// read, and the child must be reaped (Wait) so it does not linger as a
+// zombie.
+func (t *Transport) abortConnect() {
+	if t.protocol != nil {
+		_ = t.protocol.Close()
+		t.protocol = nil
+	}
+	if t.protocolAdapter != nil {
+		_ = t.protocolAdapter.Close()
+		t.protocolAdapter = nil
+	}
+	if t.cancel != nil {
+		t.cancel()
+	}
+	if t.stdin != nil {
+		_ = t.stdin.Close()
+		t.stdin = nil
+	}
+	if t.cmd != nil && t.cmd.Process != nil {
+		_ = t.cmd.Process.Kill() // best effort: it may already have exited
+	}
+
+	// The child is gone, so its stdout/stderr hit EOF and the goroutines
+	// return. Bounded anyway: a grandchild can inherit and hold the pipes.
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(terminationTimeoutSeconds * time.Second):
+	}
+
+	if t.cmd != nil && t.cmd.Process != nil {
+		_ = t.cmd.Wait() // reap; the exit status is the failure we already return
+	}
+	t.cleanup()
+}
+
 // cleanup cleans up all resources
 func (t *Transport) cleanup() {
 	if t.stdout != nil {

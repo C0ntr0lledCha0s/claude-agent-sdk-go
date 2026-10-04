@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -11,14 +12,17 @@ import (
 	"github.com/severity1/claude-agent-sdk-go/internal/shared"
 )
 
-// handleStdout processes stdout in a separate goroutine
-func (t *Transport) handleStdout() {
+// handleStdout processes stdout in a separate goroutine. It reads the pipe it
+// is handed rather than t.stdout: cleanup() nils that field, and a failed
+// Connect or a timed-out Close can reach cleanup() while this goroutine is
+// still running.
+func (t *Transport) handleStdout(stdout io.Reader) {
 	defer t.wg.Done()
 	defer close(t.msgChan)
 	defer close(t.errChan)
 	defer t.validator.MarkStreamEnd() // Mark stream end for validation
 
-	scanner := bufio.NewScanner(t.stdout)
+	scanner := bufio.NewScanner(stdout)
 
 	// Scanner token size must match the parser's buffer limit so lines aren't
 	// truncated before parsing. Default is 64KB; respect MaxBufferSize if set.
@@ -97,10 +101,10 @@ func (t *Transport) handleStdout() {
 // handleStderrCallback processes stderr in a separate goroutine.
 // Reads line-by-line, strips trailing whitespace, skips empty lines, and
 // silently ignores scanner errors.
-func (t *Transport) handleStderrCallback() {
+func (t *Transport) handleStderrCallback(stderr io.Reader) {
 	defer t.wg.Done()
 
-	scanner := bufio.NewScanner(t.stderrPipe)
+	scanner := bufio.NewScanner(stderr)
 
 	for scanner.Scan() {
 		select {

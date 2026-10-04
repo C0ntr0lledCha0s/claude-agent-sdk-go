@@ -174,12 +174,12 @@ func (t *Transport) Connect(ctx context.Context) error {
 
 	// Start I/O handling goroutines
 	t.wg.Add(1)
-	go t.handleStdout()
+	go t.handleStdout(t.stdout)
 
 	// Start stderr callback goroutine if callback is configured
 	if t.stderrPipe != nil && t.options != nil && t.options.StderrCallback != nil {
 		t.wg.Add(1)
-		go t.handleStderrCallback()
+		go t.handleStderrCallback(t.stderrPipe)
 	}
 
 	// Note: Do NOT close stdin here for one-shot mode
@@ -188,6 +188,7 @@ func (t *Transport) Connect(ctx context.Context) error {
 
 	// Set up control protocol for streaming mode only
 	if err := t.setupControlProtocol(t.ctx); err != nil {
+		t.abortConnect()
 		return err
 	}
 
@@ -196,7 +197,8 @@ func (t *Transport) Connect(ctx context.Context) error {
 }
 
 // setupControlProtocol initializes control protocol for streaming mode.
-// Returns nil immediately for one-shot mode (closeStdin == true).
+// Returns nil immediately for one-shot mode (closeStdin == true). On error the
+// caller (Connect) tears the started process down with abortConnect.
 func (t *Transport) setupControlProtocol(ctx context.Context) error {
 	if t.closeStdin {
 		return nil // One-shot mode doesn't need control protocol
@@ -206,14 +208,12 @@ func (t *Transport) setupControlProtocol(ctx context.Context) error {
 	t.protocol = control.NewProtocol(t.protocolAdapter, t.buildProtocolOptions()...)
 
 	if err := t.protocol.Start(ctx); err != nil {
-		t.cleanup()
 		return fmt.Errorf("failed to start control protocol: %w", err)
 	}
 
 	// Perform handshake when hooks, permissions, checkpointing, or SDK MCP servers configured
 	if t.needsProtocolHandshake() {
 		if _, err := t.protocol.Initialize(ctx); err != nil {
-			t.cleanup()
 			return fmt.Errorf("failed to initialize control protocol: %w", err)
 		}
 	}
