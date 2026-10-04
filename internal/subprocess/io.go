@@ -38,7 +38,11 @@ func (c childProcess) exitError(ctx context.Context, lastErrorResult string) err
 	if ctx.Err() != nil || c.cmd.ProcessState == nil || c.cmd.ProcessState.Success() {
 		return nil
 	}
-	state := c.cmd.ProcessState
+	return processExitError(c.cmd.ProcessState, lastErrorResult)
+}
+
+// processExitError reports a non-zero CLI exit. ExitCode is -1 for a signal.
+func processExitError(state *os.ProcessState, lastErrorResult string) *shared.ProcessError {
 	message := fmt.Sprintf("Claude Code process exited unexpectedly (%s)", state)
 	if lastErrorResult != "" {
 		// The CLI exits non-zero on purpose after an error result; that result
@@ -46,6 +50,15 @@ func (c childProcess) exitError(ctx context.Context, lastErrorResult string) err
 		message = "Claude Code returned an error result: " + lastErrorResult
 	}
 	return shared.NewProcessError(message, state.ExitCode(), "Check stderr output for details")
+}
+
+// exitReason says why an exited CLI can no longer serve a turn: a
+// ProcessError for a failure, a ConnectionError for a clean exit.
+func exitReason(state *os.ProcessState) error {
+	if state.Success() {
+		return shared.NewConnectionError(fmt.Sprintf("Claude Code process exited (%s)", state), nil)
+	}
+	return processExitError(state, "")
 }
 
 // handleStdout processes stdout in a separate goroutine. protocol and child

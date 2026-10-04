@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/severity1/claude-agent-sdk-go/internal/subprocess"
 )
 
 const (
@@ -936,6 +938,113 @@ func TestClientQueryStreamSendError(t *testing.T) {
 	}
 }
 
+// TestClientCallsFailAfterProcessExit verifies that once the CLI process has
+// exited, Done is closed, Err reports the exit, and every call that writes to
+// the CLI fails with a *ConnectionError wrapping that exit error instead of
+// being accepted (Python: CLIConnectionError raised from the exit error).
+func TestClientCallsFailAfterProcessExit(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+
+	calls := []struct {
+		name string
+		call func(Client) error
+	}{
+		{"Query", func(c Client) error { return c.Query(ctx, "hello") }},
+		{"QueryWithSession", func(c Client) error { return c.QueryWithSession(ctx, "hello", "s1") }},
+		{"QueryStream", func(c Client) error {
+			messages := make(chan StreamMessage, 1)
+			messages <- StreamMessage{Type: userMessageType, Message: &UserMessage{Content: "hello"}}
+			close(messages)
+			return c.QueryStream(ctx, messages)
+		}},
+		{"Interrupt", func(c Client) error { return c.Interrupt(ctx) }},
+		{"SetModel", func(c Client) error { model := testModelSonnet; return c.SetModel(ctx, &model) }},
+		{"SetPermissionMode", func(c Client) error { return c.SetPermissionMode(ctx, PermissionModeAcceptEdits) }},
+		{"RewindFiles", func(c Client) error { return c.RewindFiles(ctx, "uuid-1") }},
+		{"GetMcpStatus", func(c Client) error { _, err := c.GetMcpStatus(ctx); return err }},
+	}
+
+	for _, test := range calls {
+		t.Run(test.name, func(t *testing.T) {
+			transport := newProcessMockTransport()
+			client := setupClientForTest(t, transport)
+			defer disconnectClientSafely(t, client)
+			connectClientSafely(ctx, t, client)
+
+			done := client.Done()
+			assertChannelOpen(t, done, "Done() while the CLI runs")
+			if err := client.Err(); err != nil {
+				t.Fatalf("Err() = %v while the CLI runs, want nil", err)
+			}
+
+			exitErr := NewProcessError("Claude Code process exited unexpectedly (signal: killed)", -1, "")
+			transport.exit(exitErr)
+
+			assertChannelClosed(t, done, "Done() after the CLI exited")
+			if err := client.Err(); !errors.Is(err, exitErr) {
+				t.Fatalf("Err() = %v, want the exit error", err)
+			}
+
+			err := test.call(client)
+			if !errors.Is(err, exitErr) || !IsConnectionError(err) {
+				t.Fatalf("%s on a dead client = %v, want a *ConnectionError wrapping the exit error", test.name, err)
+			}
+			assertClientMessageCount(t, transport.clientMockTransport, 0)
+		})
+	}
+}
+
+// TestClientDoneAndErrLifecycle verifies Done and Err before Connect, while
+// connected, after Disconnect and after a reconnect. A transport that does not
+// report its process gets a Done that closes on Disconnect.
+func TestClientDoneAndErrLifecycle(t *testing.T) {
+	ctx, cancel := setupClientTestContext(t, 10*time.Second)
+	defer cancel()
+
+	tests := []struct {
+		name      string
+		transport func() Transport
+	}{
+		{"process_transport", func() Transport { return newProcessMockTransport() }},
+		{"custom_transport_fallback", func() Transport { return newClientMockTransport() }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := setupClientForTest(t, test.transport())
+
+			assertChannelClosed(t, client.Done(), "Done() before Connect")
+			assertClientError(t, client.Err(), true, "client not connected")
+
+			connectClientSafely(ctx, t, client)
+			done := client.Done()
+			assertChannelOpen(t, done, "Done() while connected")
+			assertNoError(t, client.Err())
+
+			disconnectClientSafely(t, client)
+			assertChannelClosed(t, done, "Done() of the connection after Disconnect")
+			assertChannelClosed(t, client.Done(), "Done() after Disconnect")
+			assertClientError(t, client.Err(), true, "client not connected")
+
+			connectClientSafely(ctx, t, client)
+			defer disconnectClientSafely(t, client)
+			assertChannelOpen(t, client.Done(), "Done() after reconnecting")
+			assertNoError(t, client.Err())
+		})
+	}
+}
+
+// TestSubprocessTransportReportsProcessExit guards the optional interface
+// that Done and Err type-assert: if the subprocess transport stopped
+// satisfying it, Done would silently close only on Disconnect.
+func TestSubprocessTransportReportsProcessExit(t *testing.T) {
+	var transport Transport = subprocess.New("claude", NewOptions(), "sdk-go-client")
+	if _, ok := transport.(processWatcher); !ok {
+		t.Fatal("subprocess.Transport does not implement processWatcher")
+	}
+}
+
 // TestClientResponseSequencing tests pre-configured response sequences
 // Covers T137: Client Message Reception + T138: Client Response Iterator + T147: Client Message Ordering
 func TestClientResponseSequencing(t *testing.T) {
@@ -1369,6 +1478,61 @@ func (c *clientMockTransport) GetMcpStatus(_ context.Context) (*McpStatusRespons
 	return &McpStatusResponse{McpServers: []McpServerStatus{}}, nil
 }
 
+// processMockTransport is a clientMockTransport that reports the exit of its
+// CLI process through Done and Err, like the subprocess transport.
+type processMockTransport struct {
+	*clientMockTransport
+	procMu  sync.Mutex
+	done    chan struct{}
+	exitErr error
+}
+
+func newProcessMockTransport() *processMockTransport {
+	return &processMockTransport{clientMockTransport: newClientMockTransport()}
+}
+
+func (p *processMockTransport) Connect(ctx context.Context) error {
+	if err := p.clientMockTransport.Connect(ctx); err != nil {
+		return err
+	}
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	p.done = make(chan struct{})
+	p.exitErr = nil
+	return nil
+}
+
+// exit simulates the CLI process exiting with err.
+func (p *processMockTransport) exit(err error) {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	if p.done == nil || p.exitErr != nil {
+		return
+	}
+	p.exitErr = err
+	close(p.done)
+}
+
+func (p *processMockTransport) Close() error {
+	if err := p.clientMockTransport.Close(); err != nil {
+		return err
+	}
+	p.exit(errors.New("transport closed"))
+	return nil
+}
+
+func (p *processMockTransport) Done() <-chan struct{} {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	return p.done
+}
+
+func (p *processMockTransport) Err() error {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	return p.exitErr
+}
+
 // Streamlined Mock Transport Options - reduced from 11 to 6 essential functions
 type ClientMockTransportOption func(*clientMockTransport)
 
@@ -1504,6 +1668,24 @@ func assertClientMessageCount(t *testing.T, transport *clientMockTransport, expe
 	actual := transport.getSentMessageCount()
 	if actual != expected {
 		t.Errorf("Expected %d sent messages, got %d", expected, actual)
+	}
+}
+
+func assertChannelOpen(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+		t.Fatalf("%s is closed, want open", what)
+	default:
+	}
+}
+
+func assertChannelClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatalf("%s is open, want closed", what)
 	}
 }
 

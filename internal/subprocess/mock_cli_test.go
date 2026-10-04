@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"regexp"
 	"strings"
@@ -67,6 +68,9 @@ const (
 	mockModeSlowExitAfterEOF    = "slow_exit_after_eof"
 	mockModeStopReading         = "stop_reading"
 	mockModeFixedSizeLine       = "fixed_size_line"
+	mockModeExitClean           = "exit_clean"
+	mockModeOrphanStdout        = "orphan_stdout"
+	mockModeHoldStdout          = "hold_stdout"
 )
 
 // Event names written to the mock event log.
@@ -325,10 +329,16 @@ func runMockTwoPermissionRequests() {
 // slowExitDelay is how long slow_exit_after_eof keeps running after stdin EOF.
 const slowExitDelay = 1500 * time.Millisecond
 
-// runShutdownMock runs the shutdown modes and exits 2 for an unknown mode.
-// Split from runMockCLI to keep its complexity flat.
+// runShutdownMock runs the shutdown and exit modes and exits 2 for an unknown
+// mode. Split from runMockCLI to keep its complexity flat.
 func runShutdownMock(mode string) {
 	switch mode {
+	case mockModeExitClean:
+		answerInitialize()
+	case mockModeOrphanStdout:
+		runMockOrphanStdout()
+	case mockModeHoldStdout:
+		time.Sleep(orphanHoldTime)
 	case mockModeIgnoreSIGTERM:
 		runMockIgnoreSIGTERM()
 	case mockModeSlowExitAfterEOF:
@@ -363,6 +373,25 @@ func fixedSizeAssistantLine(n int) string {
 	const prefix = `{"type":"assistant","message":{"content":[{"type":"text","text":"`
 	const suffix = `"}],"model":"claude-3"}}`
 	return prefix + strings.Repeat("x", n-len(prefix)-len(suffix)) + suffix
+}
+
+// orphanHoldTime is how long the hold_stdout descendant keeps stdout open
+// after the orphan_stdout mock has exited.
+const orphanHoldTime = 4 * time.Second
+
+// runMockOrphanStdout answers initialize, starts a descendant that inherits
+// stdout and outlives it, then exits non-zero. The CLI is gone while stdout
+// stays open, like a CLI whose background child kept the pipe.
+func runMockOrphanStdout() {
+	answerInitialize()
+	//nolint:gosec // G204: re-runs the test binary as the descendant
+	descendant := exec.Command(os.Args[0])
+	descendant.Env = append(os.Environ(), envMockMode+"="+mockModeHoldStdout)
+	descendant.Stdout = os.Stdout
+	if err := descendant.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "start descendant: %v\n", err)
+	}
+	os.Exit(mockCrashExitCode)
 }
 
 // runMockIgnoreSIGTERM logs and ignores SIGTERM, so only SIGKILL ends it.

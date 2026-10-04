@@ -130,6 +130,11 @@ const (
 
 // Transport abstracts the communication layer with Claude Code CLI.
 // This interface stays in main package because it's used by client code.
+//
+// A Transport can also report the exit of its CLI process by implementing
+// Done() <-chan struct{} and Err() error with the semantics of Client.Done
+// and Client.Err. The subprocess transport does; for one that does not,
+// Client.Done closes on Disconnect.
 type Transport interface {
 	// Connect starts the CLI. ctx bounds only the connect step; the CLI
 	// runs until Close.

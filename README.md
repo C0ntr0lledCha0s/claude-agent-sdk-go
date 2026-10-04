@@ -158,7 +158,8 @@ func main() {
             select {
             case message := <-msgChan:
                 if message == nil {
-                    return nil // Stream ended
+                    // The CLI process exited; Err says why.
+                    return fmt.Errorf("stream ended: %w", client.Err())
                 }
 
                 switch msg := message.(type) {
@@ -403,6 +404,7 @@ The SDK includes advanced capabilities for production use:
 - **File Checkpointing** - Track and rewind file changes ([Example 13](examples/13_file_checkpointing/))
 - **SDK MCP Servers** - Create in-process custom tools ([Example 14](examples/14_sdk_mcp_server/))
 - **Stream Diagnostics** - Monitor stream health with `GetStreamIssues()` and `GetStreamStats()`
+- **Process Lifecycle** - `Done()` closes when the CLI process exits and `Err()` says why
 
 See the [examples directory](examples/README.md) for complete documentation.
 

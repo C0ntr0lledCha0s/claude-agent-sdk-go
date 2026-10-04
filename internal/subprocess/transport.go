@@ -119,6 +119,41 @@ func (t *Transport) processExitedLocked() bool {
 	}
 }
 
+// closedDone is the Done channel of a transport with no CLI process.
+var closedDone = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
+
+// Done returns a channel that is closed when the CLI process started by
+// Connect exits, on its own or through Close. It does not wait for stdout
+// EOF. Before Connect and after Close it returns a closed channel.
+func (t *Transport) Done() <-chan struct{} {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.processDone == nil {
+		return closedDone
+	}
+	return t.processDone
+}
+
+// Err returns nil while the CLI process runs. Once Done is closed it returns
+// why: a *shared.ProcessError for a non-zero exit (ExitCode -1 for a signal),
+// a *shared.ConnectionError for a clean exit, and a not-connected error
+// before Connect and after Close.
+func (t *Transport) Err() error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.processDone == nil {
+		return fmt.Errorf("transport not connected")
+	}
+	if !t.processExitedLocked() {
+		return nil
+	}
+	return exitReason(t.cmd.ProcessState)
+}
+
 // Connect starts the Claude CLI subprocess.
 func (t *Transport) Connect(ctx context.Context) error {
 	t.mu.Lock()
@@ -292,8 +327,8 @@ func (t *Transport) openStdin() (*stdinWriter, error) {
 		return nil, fmt.Errorf("transport not connected or stdin closed")
 	}
 	if t.processExitedLocked() {
-		return nil, shared.NewConnectionError(
-			fmt.Sprintf("cannot write to terminated CLI process (%s)", t.cmd.ProcessState), nil)
+		// Python raises CLIConnectionError from the exit error.
+		return nil, shared.NewConnectionError("cannot write to terminated CLI process", exitReason(t.cmd.ProcessState))
 	}
 	return t.stdin, nil
 }

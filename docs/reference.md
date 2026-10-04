@@ -373,6 +373,8 @@ type Client interface {
     GetStreamIssues() []StreamIssue
     GetStreamStats() StreamStats
     GetServerInfo(ctx context.Context) (map[string]interface{}, error)
+    Done() <-chan struct{}
+    Err() error
 }
 ```
 
@@ -496,6 +498,30 @@ Get diagnostic information from the CLI.
 
 ```go
 func (c *ClientImpl) GetServerInfo(ctx context.Context) (map[string]interface{}, error)
+```
+
+#### `Done()`
+
+Get a channel that closes when the connected CLI process exits, on its own or through `Disconnect()`. It follows `context.Context`: once it is closed, `Err()` says why. It does not wait for the `ReceiveMessages()` channel, which can still hold messages, or stay open while a process the CLI started holds its stdout. Before `Connect()` and after `Disconnect()` the channel is closed. With a custom `Transport` that does not implement `Done()`/`Err()`, it closes on `Disconnect()`.
+
+```go
+func (c *ClientImpl) Done() <-chan struct{}
+```
+
+#### `Err()`
+
+Get why the CLI process stopped. Returns nil while it runs, a `*ProcessError` for a non-zero exit (`ExitCode` is -1 for a signal), a `*ConnectionError` for a clean exit, and a "client not connected" error before `Connect()` and after `Disconnect()`. Once the process is gone, `Query`, `QueryWithSession`, `QueryStream`, `Interrupt`, `SetModel`, `SetPermissionMode`, `RewindFiles` and `GetMcpStatus` return a `*ConnectionError` that wraps it (Python raises `CLIConnectionError` from the exit error).
+
+```go
+func (c *ClientImpl) Err() error
+
+select {
+case <-client.Done():
+    if procErr := claudecode.AsProcessError(client.Err()); procErr != nil {
+        log.Printf("CLI exited with code %d", procErr.ExitCode)
+    }
+case <-ctx.Done():
+}
 ```
 
 ### Client Examples

@@ -105,6 +105,7 @@ These contributor PRs are open and not merged. The tracker rows keep their statu
 | `QueryStream(ctx, messages)` | Send messages from a channel |
 | `GetStreamIssues()` | Get validation issues from stream |
 | `GetStreamStats()` | Get stream statistics |
+| `Done()` / `Err()` | Report when the CLI process exits and why. Python's `receive_messages()` raises the `ProcessError`; a Go channel cannot carry it, so these follow `context.Context` |
 
 ---
 

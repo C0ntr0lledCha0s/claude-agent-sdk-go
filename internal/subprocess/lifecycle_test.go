@@ -3,6 +3,7 @@ package subprocess
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -268,4 +269,165 @@ func TestTransportCloseReportsNoProcessError(t *testing.T) {
 			t.Fatalf("Close reported a ProcessError: %v", err)
 		}
 	}
+}
+
+// TestTransportDoneReportsCLIExit verifies that Done closes when the CLI
+// exits on its own and that Err then says why.
+func TestTransportDoneReportsCLIExit(t *testing.T) {
+	tests := []struct {
+		name string
+		mode string
+		kill bool
+		// wantExitCode is checked only when wantProcessError is set.
+		wantExitCode     int
+		wantProcessError bool
+	}{
+		{name: "non_zero_exit", mode: mockModeExitNonZero, wantExitCode: mockCrashExitCode, wantProcessError: true},
+		{name: "killed", mode: mockModeDefault, kill: true, wantExitCode: killedExitCode(), wantProcessError: true},
+		{name: "clean_exit", mode: mockModeExitClean},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+			defer cancel()
+
+			transport := New(newTransportMockCLIMode(t, test.mode), &shared.Options{}, "sdk-go")
+			t.Cleanup(func() { _ = transport.Close() })
+			connectTransportSafely(ctx, t, transport)
+
+			if test.kill {
+				if err := transport.Err(); err != nil {
+					t.Fatalf("Err() = %v while the CLI runs, want nil", err)
+				}
+				if err := transport.cmd.Process.Kill(); err != nil {
+					t.Fatalf("kill CLI: %v", err)
+				}
+			}
+
+			select {
+			case <-transport.Done():
+			case <-ctx.Done():
+				t.Fatal("Done() did not close after the CLI exited")
+				return
+			}
+
+			assertExitReason(t, transport.Err(), test.wantProcessError, test.wantExitCode)
+		})
+	}
+}
+
+// TestTransportDoneClosesBeforeStdoutEOF verifies that Done reports the CLI
+// exit while a descendant still holds stdout open.
+func TestTransportDoneClosesBeforeStdoutEOF(t *testing.T) {
+	ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+	defer cancel()
+
+	transport := New(newTransportMockCLIMode(t, mockModeOrphanStdout), &shared.Options{}, "sdk-go")
+	t.Cleanup(func() { _ = transport.Close() })
+	connectTransportSafely(ctx, t, transport)
+	msgChan, _ := transport.ReceiveMessages(ctx)
+
+	for done := false; !done; {
+		select {
+		case <-transport.Done():
+			done = true
+		case _, ok := <-msgChan:
+			if !ok {
+				t.Fatal("message channel closed before Done(), want Done() first")
+				return
+			}
+		case <-ctx.Done():
+			t.Fatal("Done() did not close after the CLI exited")
+			return
+		}
+	}
+	assertExitReason(t, transport.Err(), true, mockCrashExitCode)
+
+	// The stream ends once the descendant exits and closes stdout.
+	for msgChan != nil {
+		select {
+		case _, ok := <-msgChan:
+			if !ok {
+				msgChan = nil
+			}
+		case <-ctx.Done():
+			t.Fatal("message channel did not close after the descendant exited")
+			return
+		}
+	}
+}
+
+// TestTransportDoneBeforeConnectAndAfterClose verifies that a transport with
+// no running CLI reports a closed Done and a non-nil Err.
+func TestTransportDoneBeforeConnectAndAfterClose(t *testing.T) {
+	ctx, cancel := setupTransportTestContext(t, 30*time.Second)
+	defer cancel()
+
+	transport := New(newTransportMockCLI(t), &shared.Options{}, "sdk-go")
+	assertTransportStopped(t, transport, "before Connect")
+
+	connectTransportSafely(ctx, t, transport)
+	done := transport.Done()
+	select {
+	case <-done:
+		t.Fatal("Done() closed while the CLI runs")
+	default:
+	}
+	if err := transport.Err(); err != nil {
+		t.Fatalf("Err() = %v while the CLI runs, want nil", err)
+	}
+
+	if err := transport.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("Done() from the connection did not close after Close()")
+	}
+	assertTransportStopped(t, transport, "after Close")
+}
+
+// assertExitReason checks Err after the CLI exited on its own.
+func assertExitReason(t *testing.T, err error, wantProcessError bool, wantExitCode int) {
+	t.Helper()
+	var processErr *shared.ProcessError
+	isProcessErr := errors.As(err, &processErr)
+	if !wantProcessError {
+		var connErr *shared.ConnectionError
+		if !errors.As(err, &connErr) || isProcessErr {
+			t.Fatalf("Err() = %v (%T), want *ConnectionError for a clean exit", err, err)
+		}
+		return
+	}
+	if !isProcessErr {
+		t.Fatalf("Err() = %v (%T), want *ProcessError", err, err)
+		return
+	}
+	if processErr.ExitCode != wantExitCode {
+		t.Errorf("ExitCode = %d, want %d", processErr.ExitCode, wantExitCode)
+	}
+}
+
+// assertTransportStopped checks Done and Err when no CLI process is running.
+func assertTransportStopped(t *testing.T, transport *Transport, when string) {
+	t.Helper()
+	select {
+	case <-transport.Done():
+	default:
+		t.Fatalf("Done() is open %s, want closed", when)
+	}
+	if err := transport.Err(); err == nil {
+		t.Fatalf("Err() = nil %s, want an error", when)
+	}
+}
+
+// killedExitCode is the exit code os/exec reports for a killed process: -1
+// for a signal, and 1 on Windows, where Kill is TerminateProcess(1).
+func killedExitCode() int {
+	if runtime.GOOS == windowsOS {
+		return 1
+	}
+	return -1
 }

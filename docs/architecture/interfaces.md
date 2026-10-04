@@ -261,6 +261,10 @@ type Client interface {
     GetStreamIssues() []StreamIssue
     GetStreamStats() StreamStats
     GetServerInfo(ctx context.Context) (map[string]interface{}, error)
+
+    // Process lifecycle
+    Done() <-chan struct{}
+    Err() error
 }
 ```
 
@@ -289,6 +293,10 @@ type Client interface {
 - `GetStreamIssues()` - Get list of stream problems
 - `GetStreamStats()` - Get stream statistics
 - `GetServerInfo()` - Get CLI server information
+
+**Process Lifecycle**
+- `Done()` - Channel that closes when the CLI process exits
+- `Err()` - Why the CLI process stopped (`*ProcessError`, `*ConnectionError`, or not connected)
 
 ## Control Protocol Transport
 
