@@ -2,9 +2,11 @@ package subprocess
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,5 +54,40 @@ func TestConnectCLIExitsBeforeHandshake(t *testing.T) {
 				t.Fatalf("Close after a failed Connect: %v", cerr)
 			}
 		}
+	}
+}
+
+// TestConnectFailsFastWhenCLIExits checks the handshake notices the CLI's
+// stdout closing: Connect must fail well inside a long caller deadline (it
+// used to wait out the whole init timeout), say why, and carry the CLI's exit
+// status.
+func TestConnectFailsFastWhenCLIExits(t *testing.T) {
+	if runtime.GOOS == windowsOS {
+		t.Skip("uses a POSIX shell script as the fake CLI")
+	}
+	fake := filepath.Join(t.TempDir(), "claude-exits")
+	err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 127\n"), 0o755) // #nosec G306 - Test script needs to be executable
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tr := New(fake, &shared.Options{EnableFileCheckpointing: true}, false, "sdk-go")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = tr.Connect(ctx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Connect succeeded against a CLI that exits at once")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("Connect took %v to notice the CLI had exited", elapsed)
+	}
+	if !errors.Is(err, errCLIExitedBeforeHandshake) {
+		t.Fatalf("error does not say the CLI exited before the handshake: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit status 127") {
+		t.Fatalf("error does not carry the CLI's exit status: %v", err)
 	}
 }

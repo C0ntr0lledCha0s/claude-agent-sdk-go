@@ -4,6 +4,7 @@ package subprocess
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -68,7 +69,17 @@ type Transport struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// stdoutDone is closed when handleStdout returns: the CLI closed stdout
+	// (normally because it exited). The handshake watches it so a CLI that
+	// dies before answering fails Connect at once instead of waiting out the
+	// init timeout.
+	stdoutDone chan struct{}
 }
+
+// errCLIExitedBeforeHandshake is returned (wrapped) by Connect when the CLI's
+// stdout closes before it answers the control-protocol handshake.
+var errCLIExitedBeforeHandshake = errors.New("claude CLI exited before completing the control-protocol handshake")
 
 // New creates a new subprocess transport.
 func New(cliPath string, options *shared.Options, closeStdin bool, entrypoint string) *Transport {
@@ -173,8 +184,9 @@ func (t *Transport) Connect(ctx context.Context) error {
 	t.errChan = make(chan error, channelBufferSize)
 
 	// Start I/O handling goroutines
+	t.stdoutDone = make(chan struct{})
 	t.wg.Add(1)
-	go t.handleStdout(t.stdout)
+	go t.handleStdout(t.stdout, t.stdoutDone)
 
 	// Start stderr callback goroutine if callback is configured
 	if t.stderrPipe != nil && t.options != nil && t.options.StderrCallback != nil {
@@ -188,7 +200,10 @@ func (t *Transport) Connect(ctx context.Context) error {
 
 	// Set up control protocol for streaming mode only
 	if err := t.setupControlProtocol(t.ctx); err != nil {
-		t.abortConnect()
+		waitErr := t.abortConnect()
+		if errors.Is(err, errCLIExitedBeforeHandshake) && waitErr != nil {
+			err = fmt.Errorf("%w (%v)", err, waitErr) // e.g. "exit status 127"
+		}
 		return err
 	}
 
@@ -213,12 +228,36 @@ func (t *Transport) setupControlProtocol(ctx context.Context) error {
 
 	// Perform handshake when hooks, permissions, checkpointing, or SDK MCP servers configured
 	if t.needsProtocolHandshake() {
-		if _, err := t.protocol.Initialize(ctx); err != nil {
+		if err := t.initializeProtocol(ctx); err != nil {
 			return fmt.Errorf("failed to initialize control protocol: %w", err)
 		}
 	}
 
 	return nil
+}
+
+// initializeProtocol runs the handshake on a context that is also cancelled
+// when the CLI's stdout closes, so a CLI that exits first fails fast. A real
+// error the CLI reported (HandleControlInitErr) is returned as is; only a wait
+// cut short by the stdout watcher, with the caller's ctx still live, becomes
+// errCLIExitedBeforeHandshake.
+func (t *Transport) initializeProtocol(ctx context.Context) error {
+	initCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	stdoutDone := t.stdoutDone
+	go func() {
+		select {
+		case <-stdoutDone:
+			stop()
+		case <-initCtx.Done():
+		}
+	}()
+
+	_, err := t.protocol.Initialize(initCtx)
+	if err != nil && errors.Is(err, context.Canceled) && ctx.Err() == nil {
+		return errCLIExitedBeforeHandshake
+	}
+	return err
 }
 
 // needsProtocolHandshake returns true if control protocol handshake is required.

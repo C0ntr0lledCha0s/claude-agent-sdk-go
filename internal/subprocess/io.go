@@ -16,8 +16,9 @@ import (
 // is handed rather than t.stdout: cleanup() nils that field, and a failed
 // Connect or a timed-out Close can reach cleanup() while this goroutine is
 // still running.
-func (t *Transport) handleStdout(stdout io.Reader) {
+func (t *Transport) handleStdout(stdout io.Reader, done chan struct{}) {
 	defer t.wg.Done()
+	defer close(done)
 	defer close(t.msgChan)
 	defer close(t.errChan)
 	defer t.validator.MarkStreamEnd() // Mark stream end for validation

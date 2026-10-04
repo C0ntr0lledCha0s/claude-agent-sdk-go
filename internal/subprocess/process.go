@@ -84,8 +84,9 @@ func (t *Transport) terminateProcess() error {
 // SIGTERM: the process is killed at once. The order matters: the I/O
 // goroutines must have returned before cleanup() releases the pipes they
 // read, and the child must be reaped (Wait) so it does not linger as a
-// zombie.
-func (t *Transport) abortConnect() {
+// zombie. It returns the child's Wait error (its exit status), which Connect
+// adds to the error it reports when the CLI died before the handshake.
+func (t *Transport) abortConnect() error {
 	if t.protocol != nil {
 		_ = t.protocol.Close()
 		t.protocol = nil
@@ -117,10 +118,12 @@ func (t *Transport) abortConnect() {
 	case <-time.After(terminationTimeoutSeconds * time.Second):
 	}
 
+	var waitErr error
 	if t.cmd != nil && t.cmd.Process != nil {
-		_ = t.cmd.Wait() // reap; the exit status is the failure we already return
+		waitErr = t.cmd.Wait() // reap
 	}
 	t.cleanup()
+	return waitErr
 }
 
 // cleanup cleans up all resources
