@@ -370,6 +370,7 @@ type Client interface {
     SetPermissionMode(ctx context.Context, mode PermissionMode) error
     RewindFiles(ctx context.Context, messageUUID string) error
     GetMcpStatus(ctx context.Context) (*McpStatusResponse, error)
+    StopTask(ctx context.Context, taskID string) error
     GetStreamIssues() []StreamIssue
     GetStreamStats() StreamStats
     GetServerInfo(ctx context.Context) (map[string]interface{}, error)
@@ -475,6 +476,16 @@ Get the connection status of all configured MCP servers. Only works after `Conne
 ```go
 func (c *ClientImpl) GetMcpStatus(ctx context.Context) (*McpStatusResponse, error)
 ```
+
+#### `StopTask()`
+
+Stop one running task, such as a single subagent, by the `TaskID` of its [`TaskStartedMessage`](#task-messages). The rest of the session keeps running. Sends the `stop_task` control request. Only works after `Connect()`.
+
+```go
+func (c *ClientImpl) StopTask(ctx context.Context, taskID string) error
+```
+
+The CLI then reports the task's end as a `TaskUpdatedMessage` whose status is `killed`. A `TaskNotificationMessage` with status `stopped` may follow, but the CLI sometimes omits it, so clear the task on a terminal status from either message (`IsTerminalTaskStatus`).
 
 #### `GetStreamIssues()`
 
@@ -1330,6 +1341,104 @@ type SystemMessage struct {
     Subtype     string
     Data        map[string]any
 }
+```
+
+Methods (see [Task Messages](#task-messages)):
+- `AsTaskStarted() (*TaskStartedMessage, bool)`
+- `AsTaskProgress() (*TaskProgressMessage, bool)`
+- `AsTaskNotification() (*TaskNotificationMessage, bool)`
+- `AsTaskUpdated() (*TaskUpdatedMessage, bool)`
+
+### Task Messages
+
+The CLI reports tasks (subagents started by the Agent/Task tool, background Bash commands) as `system` messages with the subtypes `task_started`, `task_progress`, `task_notification` and `task_updated`. They arrive on the stream as `*SystemMessage`, like every other system message. The `AsTask*` methods return the typed form; each typed message embeds the `SystemMessage`, so `Subtype` and the raw `Data` (including fields the typed form does not model) stay available.
+
+```go
+switch msg := message.(type) {
+case *claudecode.SystemMessage:
+    if started, ok := msg.AsTaskStarted(); ok {
+        fmt.Println("task started:", started.TaskID, started.Description)
+    }
+    if updated, ok := msg.AsTaskUpdated(); ok && updated.Status != nil &&
+        claudecode.IsTerminalTaskStatus(string(*updated.Status)) {
+        fmt.Println("task ended:", updated.TaskID)
+    }
+}
+```
+
+```go
+type TaskStartedMessage struct {
+    SystemMessage
+    TaskID      string
+    Description string
+    UUID        string
+    SessionID   string
+    ToolUseID   *string
+    TaskType    *string
+}
+
+type TaskProgressMessage struct {
+    SystemMessage
+    TaskID       string
+    Description  string
+    Usage        TaskUsage
+    UUID         string
+    SessionID    string
+    ToolUseID    *string
+    LastToolName *string
+}
+
+type TaskNotificationMessage struct {
+    SystemMessage
+    TaskID     string
+    Status     TaskNotificationStatus // completed, failed or stopped
+    OutputFile string
+    Summary    string
+    UUID       string
+    SessionID  string
+    ToolUseID  *string
+    Usage      *TaskUsage
+}
+
+type TaskUpdatedMessage struct {
+    SystemMessage
+    TaskID    string
+    Patch     map[string]any     // the task fields that changed
+    Status    *TaskUpdatedStatus // Patch["status"], when it is a string
+    SessionID *string
+    UUID      *string
+}
+
+type TaskUsage struct {
+    TotalTokens int
+    ToolUses    int
+    DurationMs  int
+}
+```
+
+A `task_started`, `task_progress` or `task_notification` message that lacks a required field (the non-pointer fields above) is a `MessageParseError`. A `task_updated` message never fails to parse: a missing `task_id` is `""` and a `patch` that is not an object is an empty map.
+
+```go
+const (
+    SystemSubtypeTaskStarted      = "task_started"
+    SystemSubtypeTaskProgress     = "task_progress"
+    SystemSubtypeTaskNotification = "task_notification"
+    SystemSubtypeTaskUpdated      = "task_updated"
+
+    TaskNotificationStatusCompleted TaskNotificationStatus = "completed"
+    TaskNotificationStatusFailed    TaskNotificationStatus = "failed"
+    TaskNotificationStatusStopped   TaskNotificationStatus = "stopped"
+
+    TaskUpdatedStatusPending   TaskUpdatedStatus = "pending"
+    TaskUpdatedStatusRunning   TaskUpdatedStatus = "running"
+    TaskUpdatedStatusPaused    TaskUpdatedStatus = "paused"
+    TaskUpdatedStatusCompleted TaskUpdatedStatus = "completed"
+    TaskUpdatedStatusFailed    TaskUpdatedStatus = "failed"
+    TaskUpdatedStatusKilled    TaskUpdatedStatus = "killed"
+)
+
+// IsTerminalTaskStatus reports whether status is completed, failed, stopped or killed.
+func IsTerminalTaskStatus(status string) bool
 ```
 
 ### `ResultMessage`
@@ -2550,6 +2659,7 @@ type Transport interface {
     SetPermissionMode(ctx context.Context, mode PermissionMode) error
     RewindFiles(ctx context.Context, userMessageID string) error
     GetMcpStatus(ctx context.Context) (*McpStatusResponse, error)
+    StopTask(ctx context.Context, taskID string) error
     Close() error
     GetValidator() *StreamValidator
 }

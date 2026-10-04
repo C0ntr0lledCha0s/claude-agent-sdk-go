@@ -1139,6 +1139,7 @@ func TestClientCallsFailAfterProcessExit(t *testing.T) {
 		{"SetPermissionMode", func(c Client) error { return c.SetPermissionMode(ctx, PermissionModeAcceptEdits) }},
 		{"RewindFiles", func(c Client) error { return c.RewindFiles(ctx, "uuid-1") }},
 		{"GetMcpStatus", func(c Client) error { _, err := c.GetMcpStatus(ctx); return err }},
+		{"StopTask", func(c Client) error { return c.StopTask(ctx, "task-1") }},
 	}
 
 	for _, test := range calls {
@@ -1453,6 +1454,8 @@ type clientMockTransport struct {
 	rewindFilesError       error
 	getMcpStatusError      error
 	getMcpStatusResponse   *McpStatusResponse
+	stopTaskError          error
+	stoppedTaskIDs         []string
 }
 
 func (c *clientMockTransport) Connect(ctx context.Context) error {
@@ -1743,6 +1746,22 @@ func testInitializeResponse() map[string]interface{} {
 	}
 }
 
+func (c *clientMockTransport) StopTask(_ context.Context, taskID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopTaskError != nil {
+		return c.stopTaskError
+	}
+	c.stoppedTaskIDs = append(c.stoppedTaskIDs, taskID)
+	return nil
+}
+
+func (c *clientMockTransport) getStoppedTaskIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.stoppedTaskIDs...)
+}
+
 // Streamlined Mock Transport Options - reduced from 11 to 6 essential functions
 type ClientMockTransportOption func(*clientMockTransport)
 
@@ -1784,6 +1803,10 @@ func WithClientGetMcpStatusError(err error) ClientMockTransportOption {
 
 func WithClientGetMcpStatusResponse(resp *McpStatusResponse) ClientMockTransportOption {
 	return func(t *clientMockTransport) { t.getMcpStatusResponse = resp }
+}
+
+func WithClientStopTaskError(err error) ClientMockTransportOption {
+	return func(t *clientMockTransport) { t.stopTaskError = err }
 }
 
 // Factory Functions - streamlined creation methods
@@ -3365,6 +3388,81 @@ func testClientGetMcpStatusTransportError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "transport mcp status error") {
 		t.Errorf("expected transport error, got: %v", err)
+	}
+}
+
+// TestClientStopTask tests StopTask delegation through the client layer.
+func TestClientStopTask(t *testing.T) {
+	tests := []struct {
+		name        string
+		options     []ClientMockTransportOption
+		connect     bool
+		cancelFirst bool
+		wantErr     string
+		wantStopped []string
+	}{
+		{
+			name:        "success",
+			connect:     true,
+			wantStopped: []string{"task-abc123"},
+		},
+		{
+			name:    "not_connected",
+			wantErr: "not connected",
+		},
+		{
+			name:        "context_cancelled",
+			connect:     true,
+			cancelFirst: true,
+			wantErr:     "context canceled",
+		},
+		{
+			name:    "transport_error",
+			options: []ClientMockTransportOption{WithClientStopTaskError(errors.New("transport stop task error"))},
+			connect: true,
+			wantErr: "transport stop task error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := setupClientTestContext(t, 5*time.Second)
+			defer cancel()
+
+			transport := newClientMockTransportWithOptions(tt.options...)
+			client := setupClientForTest(t, transport)
+			defer disconnectClientSafely(t, client)
+
+			if tt.connect {
+				connectClientSafely(ctx, t, client)
+			}
+			if tt.cancelFirst {
+				cancel()
+			}
+
+			err := client.StopTask(ctx, "task-abc123")
+
+			assertClientErrorContains(t, err, tt.wantErr)
+			if got := transport.getStoppedTaskIDs(); fmt.Sprint(got) != fmt.Sprint(tt.wantStopped) {
+				t.Errorf("stopped task IDs = %v, want %v", got, tt.wantStopped)
+			}
+		})
+	}
+}
+
+func assertClientErrorContains(t *testing.T, err error, want string) {
+	t.Helper()
+	if want == "" {
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatalf("expected error containing %q, got nil", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("expected error containing %q, got: %v", want, err)
 	}
 }
 

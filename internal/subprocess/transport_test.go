@@ -757,6 +757,28 @@ func TestTransportControlProtocolIntegration(t *testing.T) {
 			wantErr:   false,
 			errSubstr: "",
 		},
+		{
+			name: "StopTask_requires_connection",
+			setup: func() *Transport {
+				return setupTransportForTest(t, newTransportMockCLI(t))
+			},
+			operation: func(ctx context.Context, t *Transport) error {
+				return t.StopTask(ctx, "task-abc123")
+			},
+			wantErr:   true,
+			errSubstr: "not connected",
+		},
+		{
+			name: "StopTask_in_streaming_mode_with_protocol",
+			setup: func() *Transport {
+				return setupTransportForTest(t, newTransportMockCLIWithControlProtocol(t))
+			},
+			operation: func(ctx context.Context, t *Transport) error {
+				return t.StopTask(ctx, "task-abc123")
+			},
+			wantErr:   false,
+			errSubstr: "",
+		},
 	}
 
 	for _, tt := range tests {

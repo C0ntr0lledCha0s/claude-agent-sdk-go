@@ -51,6 +51,35 @@ type RateLimitEventMessage = shared.RateLimitEventMessage
 // RateLimitInfo is the window state carried by RateLimitEventMessage.
 type RateLimitInfo = shared.RateLimitInfo
 
+// TaskStartedMessage is the typed form of a task_started system message,
+// returned by SystemMessage.AsTaskStarted. Its TaskID is the ID StopTask takes.
+type TaskStartedMessage = shared.TaskStartedMessage
+
+// TaskProgressMessage is the typed form of a task_progress system message,
+// returned by SystemMessage.AsTaskProgress.
+type TaskProgressMessage = shared.TaskProgressMessage
+
+// TaskNotificationMessage is the typed form of a task_notification system
+// message, returned by SystemMessage.AsTaskNotification.
+type TaskNotificationMessage = shared.TaskNotificationMessage
+
+// TaskUpdatedMessage is the typed form of a task_updated system message,
+// returned by SystemMessage.AsTaskUpdated.
+type TaskUpdatedMessage = shared.TaskUpdatedMessage
+
+// TaskUsage is the usage reported in task_progress and task_notification messages.
+type TaskUsage = shared.TaskUsage
+
+// TaskNotificationStatus is the status of a TaskNotificationMessage.
+type TaskNotificationStatus = shared.TaskNotificationStatus
+
+// TaskUpdatedStatus is the status reported inside a TaskUpdatedMessage patch.
+type TaskUpdatedStatus = shared.TaskUpdatedStatus
+
+// IsTerminalTaskStatus reports whether a TaskNotificationMessage or
+// TaskUpdatedMessage status means the task has finished.
+var IsTerminalTaskStatus = shared.IsTerminalTaskStatus
+
 // MessageIterator provides iteration over messages.
 type MessageIterator = shared.MessageIterator
 
@@ -79,6 +108,25 @@ const (
 
 	// Session heartbeat carrying rate-limit window state.
 	MessageTypeRateLimitEvent = shared.MessageTypeRateLimitEvent
+)
+
+// Re-export task lifecycle system message subtypes and statuses.
+const (
+	SystemSubtypeTaskStarted      = shared.SystemSubtypeTaskStarted
+	SystemSubtypeTaskProgress     = shared.SystemSubtypeTaskProgress
+	SystemSubtypeTaskNotification = shared.SystemSubtypeTaskNotification
+	SystemSubtypeTaskUpdated      = shared.SystemSubtypeTaskUpdated
+
+	TaskNotificationStatusCompleted = shared.TaskNotificationStatusCompleted
+	TaskNotificationStatusFailed    = shared.TaskNotificationStatusFailed
+	TaskNotificationStatusStopped   = shared.TaskNotificationStatusStopped
+
+	TaskUpdatedStatusPending   = shared.TaskUpdatedStatusPending
+	TaskUpdatedStatusRunning   = shared.TaskUpdatedStatusRunning
+	TaskUpdatedStatusPaused    = shared.TaskUpdatedStatusPaused
+	TaskUpdatedStatusCompleted = shared.TaskUpdatedStatusCompleted
+	TaskUpdatedStatusFailed    = shared.TaskUpdatedStatusFailed
+	TaskUpdatedStatusKilled    = shared.TaskUpdatedStatusKilled
 )
 
 // Rate-limit window status constants.
@@ -162,6 +210,9 @@ type Transport interface {
 	RewindFiles(ctx context.Context, userMessageID string) error
 	// GetMcpStatus returns the connection status of all configured MCP servers.
 	GetMcpStatus(ctx context.Context) (*McpStatusResponse, error)
+	// StopTask stops a single running task by the task_id from its
+	// task_started system message.
+	StopTask(ctx context.Context, taskID string) error
 	Close() error
 	GetValidator() *StreamValidator
 }
@@ -197,6 +248,9 @@ type SetPermissionModeRequest = control.SetPermissionModeRequest
 
 // SetModelRequest to change AI model via control protocol.
 type SetModelRequest = control.SetModelRequest
+
+// StopTaskRequest to stop a single running task via control protocol.
+type StopTaskRequest = control.StopTaskRequest
 
 // GetMcpStatusRequest to query MCP server status via control protocol.
 type GetMcpStatusRequest = control.GetMcpStatusRequest
@@ -255,6 +309,7 @@ const (
 	SubtypeMcpMessage        = control.SubtypeMcpMessage
 	SubtypeGetMcpStatus      = control.SubtypeGetMcpStatus
 	SubtypeRewindFiles       = control.SubtypeRewindFiles
+	SubtypeStopTask          = control.SubtypeStopTask
 
 	// Control response subtypes
 	ResponseSubtypeSuccess = control.ResponseSubtypeSuccess

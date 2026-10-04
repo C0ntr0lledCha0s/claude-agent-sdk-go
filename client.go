@@ -45,6 +45,10 @@ type Client interface {
 	// GetMcpStatus returns the connection status of all configured MCP servers.
 	// Only works in streaming mode (after Connect()).
 	GetMcpStatus(ctx context.Context) (*McpStatusResponse, error)
+	// StopTask stops a single running task, such as one subagent, by the
+	// task ID from its TaskStartedMessage.
+	// Only works in streaming mode (after Connect()).
+	StopTask(ctx context.Context, taskID string) error
 	GetStreamIssues() []StreamIssue
 	GetStreamStats() StreamStats
 	GetServerInfo(ctx context.Context) (map[string]interface{}, error)
@@ -689,6 +693,35 @@ func (c *ClientImpl) liveTransportLocked() (Transport, error) {
 		}
 	}
 	return c.transport, nil
+}
+
+// StopTask stops a single running task, such as one subagent, by the task ID
+// from its TaskStartedMessage. The rest of the session keeps running.
+// Returns error if not connected or if the control request fails.
+//
+// The CLI then reports the task's end as a TaskUpdatedMessage whose status is
+// terminal (killed). A TaskNotificationMessage with status stopped may follow,
+// but the CLI sometimes omits it, so clear the task on a terminal status from
+// either message (see IsTerminalTaskStatus).
+//
+// Example:
+//
+//	if sys, ok := msg.(*claudecode.SystemMessage); ok {
+//	    if started, ok := sys.AsTaskStarted(); ok {
+//	        err := client.StopTask(ctx, started.TaskID)
+//	    }
+//	}
+func (c *ClientImpl) StopTask(ctx context.Context, taskID string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	transport, err := c.liveTransport()
+	if err != nil {
+		return err
+	}
+
+	return transport.StopTask(ctx, taskID)
 }
 
 // clientIterator implements MessageIterator for client message reception

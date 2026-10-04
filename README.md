@@ -405,6 +405,7 @@ The SDK includes advanced capabilities for production use:
 - **SDK MCP Servers** - Create in-process custom tools ([Example 14](examples/14_sdk_mcp_server/))
 - **Stream Diagnostics** - Monitor stream health with `GetStreamIssues()` and `GetStreamStats()`
 - **Process Lifecycle** - `Done()` closes when the CLI process exits and `Err()` says why
+- **Task Lifecycle** - Follow subagents and background tasks with `SystemMessage.AsTaskStarted()`, `AsTaskProgress()`, `AsTaskNotification()` and `AsTaskUpdated()`, and stop a single task with `StopTask()`
 
 See the [examples directory](examples/README.md) for complete documentation.
 

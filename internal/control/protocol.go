@@ -696,6 +696,17 @@ func (p *Protocol) RewindFiles(ctx context.Context, userMessageID string) error 
 	return err
 }
 
+// StopTask stops a single running task by the task_id from its task_started
+// system message. Returns error if the control request fails or times out.
+func (p *Protocol) StopTask(ctx context.Context, taskID string) error {
+	_, err := p.SendControlRequest(ctx, StopTaskRequest{
+		Subtype: SubtypeStopTask,
+		TaskID:  taskID,
+	}, 5*time.Second)
+
+	return err
+}
+
 // ReceiveMessages returns a channel for receiving regular (non-control) messages.
 func (p *Protocol) ReceiveMessages() <-chan map[string]any {
 	return p.messageStream

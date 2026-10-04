@@ -21,9 +21,9 @@ Counts below compare Python SDK main (db750b2, Sep 30, 2026) with Go SDK v0.8.0 
 
 | Category | Python SDK | Go SDK | Notes |
 |:---------|:-----------|:-------|:------|
-| Client methods | 15 | 15 | 11 Python methods have a Go equivalent; 4 are pending; Go adds `QueryStream`, `GetStreamIssues`, `GetStreamStats` |
+| Client methods | 15 | 16 | 12 Python methods have a Go equivalent; 3 are pending; Go adds `QueryStream`, `GetStreamIssues`, `GetStreamStats` |
 | Hook events | 10 | 10 | All 10 events ported |
-| Message types (top level) | 7 | 6 (+`RawControlMessage`) | `ConversationResetMessage` pending; Python also has 6 typed `SystemMessage` subclasses that Go does not have |
+| Message types (top level) | 7 | 6 (+`RawControlMessage`) | `ConversationResetMessage` pending; Python also has 6 typed `SystemMessage` subclasses: Go has the 4 task ones as typed views of `SystemMessage`, 2 are pending |
 | Content block types | 6 | 4 | `ServerToolUseBlock` and `ServerToolResultBlock` pending |
 | Error types | 7 | 6 (+`BaseError`) | `ResultError` pending |
 | Permission modes | 6 | 4 | `dontAsk` and `auto` pending |
@@ -94,7 +94,7 @@ These contributor PRs are open and not merged. The tracker rows keep their statu
 | `disconnect()` | `Disconnect()` | PARITY |
 | `reconnect_mcp_server(name)` | - | PENDING (README #10) |
 | `toggle_mcp_server(name, enabled)` | - | PENDING (README #10) |
-| `stop_task(task_id)` | - | PENDING (README #10, Go issue #143; open Go PR #168) |
+| `stop_task(task_id)` | `StopTask(ctx, taskID)` | PARITY |
 | `get_context_usage()` | - | PENDING (README #39) |
 | `async with` context manager | `WithClient()` helper | PARITY (Go-idiomatic resource management) |
 
@@ -197,8 +197,10 @@ These contributor PRs are open and not merged. The tracker rows keep their statu
 | `StreamEvent` | `StreamEvent` struct | PARITY |
 | `RateLimitEvent` | `RateLimitEventMessage` struct | PARTIAL (README #15) |
 | `ConversationResetMessage` | - | PENDING (post-snapshot P37) |
-| `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage` | - | PENDING (README #11) |
-| `TaskUpdatedMessage` | - | PENDING (post-snapshot P27) |
+| `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage` | `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage` structs via `SystemMessage.AsTaskStarted()` etc. | PARITY (delivered as `*SystemMessage`; see README #11) |
+| `TaskUpdatedMessage` | `TaskUpdatedMessage` struct via `SystemMessage.AsTaskUpdated()` | PARITY (delivered as `*SystemMessage`) |
+| `TaskUsage`, `TaskNotificationStatus`, `TaskUpdatedStatus` | `TaskUsage`, `TaskNotificationStatus`, `TaskUpdatedStatus` | PARITY |
+| `TERMINAL_TASK_STATUSES` | `IsTerminalTaskStatus(status)` | PARITY |
 | `HookEventMessage` | - | PENDING (post-snapshot P22) |
 | `MirrorErrorMessage` | - | PENDING (post-snapshot P6) |
 | - | `RawControlMessage` struct | GO EXTRA |
@@ -450,6 +452,7 @@ Go SDK provides idiomatic helper functions following the `os.IsNotExist` pattern
 | Interrupt support | `interrupt()` | `Interrupt(ctx)` | PARITY |
 | Runtime model and permission mode | `set_model()`, `set_permission_mode()` | `SetModel()`, `SetPermissionMode()` | PARITY |
 | MCP server status | `get_mcp_status()` | `GetMcpStatus()` | PARITY |
+| Stop one task | `stop_task(task_id)` | `StopTask(ctx, taskID)` | PARITY |
 | Structured output | `output_format` | `WithOutputFormat()`, `WithJSONSchema()` | PARITY |
 | Custom agents | `agents` (sent on the initialize request) | `WithAgents()`, `WithAgent()` (sent on the initialize request) | PARITY |
 | Skills | `skills` | `WithSkills()` and helpers | PARTIAL (post-snapshot P1) |

@@ -127,6 +127,15 @@ func (t *Transport) InitializationResult() map[string]any {
 	return protocol.InitializationResult()
 }
 
+// StopTask stops a single running task by its task ID.
+func (t *Transport) StopTask(ctx context.Context, taskID string) error {
+	protocol, err := t.connectedProtocol()
+	if err != nil {
+		return err
+	}
+	return protocol.StopTask(ctx, taskID)
+}
+
 // buildProtocolOptions constructs control protocol options from transport configuration.
 func (t *Transport) buildProtocolOptions() []control.ProtocolOption {
 	var opts []control.ProtocolOption

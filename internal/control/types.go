@@ -34,6 +34,8 @@ const (
 	SubtypeMcpMessage = "mcp_message"
 	// SubtypeRewindFiles requests file rewind to a specific user message state.
 	SubtypeRewindFiles = "rewind_files"
+	// SubtypeStopTask stops a single running task.
+	SubtypeStopTask = "stop_task"
 )
 
 // Response subtype constants for control responses.
@@ -139,6 +141,14 @@ type RewindFilesRequest struct {
 	// UserMessageID is the UUID of the user message to rewind to.
 	// This should be obtained from UserMessage.UUID received during the session.
 	UserMessageID string `json:"user_message_id"`
+}
+
+// StopTaskRequest stops a single running task.
+type StopTaskRequest struct {
+	// Subtype is always SubtypeStopTask ("stop_task").
+	Subtype string `json:"subtype"`
+	// TaskID is the task_id from the task's task_started system message.
+	TaskID string `json:"task_id"`
 }
 
 // PermissionUpdateType specifies the type of permission update.

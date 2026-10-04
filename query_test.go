@@ -1069,6 +1069,10 @@ func (q *queryMockTransport) GetMcpStatus(_ context.Context) (*McpStatusResponse
 	return &McpStatusResponse{}, nil
 }
 
+func (q *queryMockTransport) StopTask(_ context.Context, _ string) error {
+	return nil
+}
+
 func (q *queryMockTransport) Close() error {
 	q.mu.Lock()
 	defer q.mu.Unlock()

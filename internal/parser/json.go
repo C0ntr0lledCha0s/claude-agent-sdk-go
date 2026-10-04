@@ -284,17 +284,24 @@ func (p *Parser) parseAssistantMessage(data map[string]any) (*shared.AssistantMe
 	}, nil
 }
 
-// parseSystemMessage parses a system message from raw JSON data.
+// parseSystemMessage parses a system message from raw JSON data. A
+// task_started, task_progress or task_notification message that lacks a
+// required field is a parse error; the typed forms come from the
+// SystemMessage's AsTask* methods.
 func (p *Parser) parseSystemMessage(data map[string]any) (*shared.SystemMessage, error) {
 	subtype, ok := data["subtype"].(string)
 	if !ok {
 		return nil, shared.NewMessageParseError("system message missing subtype field", data)
 	}
 
-	return &shared.SystemMessage{
+	msg := &shared.SystemMessage{
 		Subtype: subtype,
 		Data:    data, // Preserve all original data
-	}, nil
+	}
+	if err := shared.ValidateTaskMessage(msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
 }
 
 // parseResultMessage parses a result message from raw JSON data.

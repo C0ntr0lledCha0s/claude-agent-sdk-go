@@ -38,6 +38,10 @@ type Transport interface {
     // Requires file checkpointing to be enabled.
     RewindFiles(ctx context.Context, userMessageID string) error
 
+    // StopTask stops a single running task by the task_id from its
+    // task_started system message.
+    StopTask(ctx context.Context, taskID string) error
+
     // Close terminates the connection and cleans up resources.
     // Implements graceful shutdown: SIGTERM -> 5s wait -> SIGKILL
     Close() error
@@ -135,6 +139,20 @@ type SystemMessage struct {
 
 func (m *SystemMessage) Type() string { return "system" }
 
+// Task lifecycle subtypes (task_started, task_progress, task_notification,
+// task_updated) also arrive as *SystemMessage. AsTaskStarted, AsTaskProgress,
+// AsTaskNotification and AsTaskUpdated return typed forms that embed the
+// SystemMessage, so Subtype and Data stay available.
+type TaskStartedMessage struct {
+    SystemMessage
+    TaskID      string  `json:"task_id"`
+    Description string  `json:"description"`
+    UUID        string  `json:"uuid"`
+    SessionID   string  `json:"session_id"`
+    ToolUseID   *string `json:"tool_use_id,omitempty"`
+    TaskType    *string `json:"task_type,omitempty"`
+}
+
 // ResultMessage represents the final result of an operation.
 type ResultMessage struct {
     MessageType      string          `json:"type"`                       // Always "result"
@@ -172,7 +190,10 @@ for msg := range client.ReceiveMessages(ctx) {
     case *UserMessage:
         // Echo of user input
     case *SystemMessage:
-        // System-level events
+        // System-level events, including task lifecycle events
+        if started, ok := m.AsTaskStarted(); ok {
+            log.Printf("task %s started: %s", started.TaskID, started.Description)
+        }
     }
 }
 ```
@@ -256,6 +277,7 @@ type Client interface {
     SetModel(ctx context.Context, model *string) error
     SetPermissionMode(ctx context.Context, mode PermissionMode) error
     RewindFiles(ctx context.Context, messageUUID string) error
+    StopTask(ctx context.Context, taskID string) error
 
     // Diagnostics
     GetStreamIssues() []StreamIssue
@@ -288,6 +310,7 @@ type Client interface {
 - `SetModel()` - Change AI model mid-session
 - `SetPermissionMode()` - Change permission handling
 - `RewindFiles()` - Revert files to checkpoint
+- `StopTask()` - Stop one running task (for example a subagent) by task ID
 
 **Diagnostics**
 - `GetStreamIssues()` - Get list of stream problems
